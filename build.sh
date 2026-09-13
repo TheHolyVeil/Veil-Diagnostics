@@ -148,7 +148,9 @@ cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 QEMU_ARGS=(
   -m 512
   -net none
-  -usb -device usb-tablet
+  -device qemu-xhci,id=xhci
+  -device usb-tablet,bus=xhci.0
+  -serial stdio
   -drive format=raw,file=fat:rw:"$ESP"
 )
 

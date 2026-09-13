@@ -103,7 +103,7 @@ static const EFI_GUID gEfiBlockIoProtocolGuid = GUID(
 static const EFI_GUID gEfiSimplePointerProtocolGuid = GUID(
   0x31878C87,0x0B75,0x11D2, 0x9E,0x49,0x00,0xA0,0xC9,0x69,0x72,0x3B);
 static const EFI_GUID gEfiAbsolutePointerProtocolGuid = GUID(
-  0x8D59D32B,0xC655,0x4AE9, 0x9B,0x15,0xCA,0x7B,0x56,0x90,0x30,0x69);
+  0x8D59D32B,0xC655,0x4AE9, 0x9B,0x15,0xF2,0x59,0x04,0x99,0x2A,0x43);
 
 static int guid_equal(const EFI_GUID *a, const EFI_GUID *b) {
   const UINT8 *x = (const UINT8*)a, *y = (const UINT8*)b;
@@ -469,6 +469,12 @@ static UINTN g_num_abs_pointers = 0;
 
 static UINT64 g_mouse_packets_count = 0;
 static INT32 g_last_dx = 0, g_last_dy = 0;
+
+/* Raw absolute-pointer diagnostics, captured every poll of device[0] so we
+ * can see on-screen exactly what the firmware is actually reporting. */
+static EFI_STATUS g_last_abs_status = EFI_NOT_FOUND;
+static UINT64 g_abs_min_x = 0, g_abs_max_x = 0, g_abs_min_y = 0, g_abs_max_y = 0;
+static UINT64 g_abs_cur_x = 0, g_abs_cur_y = 0;
 
 /* ========================================================================= */
 /* Minimal runtime services (no libc)                                        */
@@ -882,6 +888,30 @@ static inline UINT8 inb(UINT16 port) {
   return ret;
 }
 
+/* Minimal COM1 (0x3F8) serial logger — bypasses the framebuffer entirely so
+ * pointer diagnostics can be read straight from QEMU's stdio/log instead of
+ * off a screenshot. Freestanding, no dependency on anything else in this
+ * file besides outb/inb above. */
+static void serial_init(void) {
+  outb(0x3F9, 0x00);
+  outb(0x3FB, 0x80);
+  outb(0x3F8, 0x01);
+  outb(0x3F9, 0x00);
+  outb(0x3FB, 0x03);
+  outb(0x3FA, 0xC7);
+  outb(0x3FC, 0x0B);
+}
+static void serial_write_str(const char *s) {
+  while (*s) {
+    if (*s == '\n') {
+      while (!(inb(0x3FD) & 0x20)) { }
+      outb(0x3F8, '\r');
+    }
+    while (!(inb(0x3FD) & 0x20)) { }
+    outb(0x3F8, (UINT8)*s++);
+  }
+}
+
 static void connect_all_controllers(EFI_BOOT_SERVICES *bs) {
   if (!bs || !bs->LocateHandleBuffer || !bs->ConnectController) return;
 
@@ -997,33 +1027,83 @@ static void init_pointer_protocols(EFI_HANDLE ImageHandle, EFI_BOOT_SERVICES *bs
 
 static void poll_pointer_inputs(UINT32 screen_w, UINT32 screen_h, int *cursor_x, int *cursor_y, BOOLEAN *curr_left_btn) {
   UINTN i;
+  BOOLEAN got_relative_packet = FALSE;
 
   for (i = 0; i < g_num_simple_pointers; i++) {
     EFI_SIMPLE_POINTER_PROTOCOL *sp = g_simple_pointers[i];
     if (!sp || !sp->GetState) continue;
 
-    EFI_SIMPLE_POINTER_STATE state;
+    EFI_SIMPLE_POINTER_STATE state = {0};
     if (sp->GetState(sp, &state) == EFI_SUCCESS) {
       g_mouse_packets_count++;
-      
+      got_relative_packet = TRUE;
+
       *cursor_x += state.RelativeMovementX;
       *cursor_y += state.RelativeMovementY;
+      g_last_dx = state.RelativeMovementX;
+      g_last_dy = state.RelativeMovementY;
 
       if (state.LeftButton) *curr_left_btn = TRUE;
     }
   }
 
-  for (i = 0; i < g_num_abs_pointers; i++) {
-    EFI_ABSOLUTE_POINTER_PROTOCOL *ap = g_abs_pointers[i];
-    if (!ap || !ap->GetState) continue;
+  /* Absolute Pointer devices (e.g. a laptop touchpad's UEFI driver) are only
+   * trusted when no relative device produced a packet this poll. On real
+   * hardware it's common to have BOTH a Simple Pointer handle (real mouse)
+   * and an idle/phantom Absolute Pointer handle. The old code applied the
+   * absolute reading unconditionally *after* the relative update, so a
+   * stale default packet (often reporting the device's min corner, i.e.
+   * bottom-left, with a garbage ActiveButtons bit) stomped the cursor and
+   * click state back every single frame — that's the "stuck" behavior. */
+  if (!got_relative_packet) {
+    for (i = 0; i < g_num_abs_pointers; i++) {
+      EFI_ABSOLUTE_POINTER_PROTOCOL *ap = g_abs_pointers[i];
+      if (!ap || !ap->GetState) continue;
 
-    EFI_ABSOLUTE_POINTER_STATE astate;
-    if (ap->GetState(ap, &astate) == EFI_SUCCESS) {
-      if (ap->Mode && (ap->Mode->AbsoluteMaxX - ap->Mode->AbsoluteMinX > 0)) {
-        *cursor_x = (int)((astate.CurrentX * screen_w) / (ap->Mode->AbsoluteMaxX - ap->Mode->AbsoluteMinX));
-        *cursor_y = (int)((astate.CurrentY * screen_h) / (ap->Mode->AbsoluteMaxY - ap->Mode->AbsoluteMinY));
+      EFI_ABSOLUTE_POINTER_STATE astate = {0};
+      EFI_STATUS abs_status = ap->GetState(ap, &astate);
+      if (i == 0) {
+        g_last_abs_status = abs_status;
+        if (ap->Mode) {
+          g_abs_min_x = ap->Mode->AbsoluteMinX; g_abs_max_x = ap->Mode->AbsoluteMaxX;
+          g_abs_min_y = ap->Mode->AbsoluteMinY; g_abs_max_y = ap->Mode->AbsoluteMaxY;
+        }
+        g_abs_cur_x = astate.CurrentX; g_abs_cur_y = astate.CurrentY;
       }
-      if (astate.ActiveButtons & 1) *curr_left_btn = TRUE;
+      if (abs_status == EFI_SUCCESS) {
+        g_mouse_packets_count++;
+
+        if (ap->Mode && ap->Mode->AbsoluteMaxX > ap->Mode->AbsoluteMinX &&
+            ap->Mode->AbsoluteMaxY > ap->Mode->AbsoluteMinY) {
+          UINT64 spanX = ap->Mode->AbsoluteMaxX - ap->Mode->AbsoluteMinX;
+          UINT64 spanY = ap->Mode->AbsoluteMaxY - ap->Mode->AbsoluteMinY;
+          UINT64 relX  = astate.CurrentX - ap->Mode->AbsoluteMinX;
+          UINT64 relY  = astate.CurrentY - ap->Mode->AbsoluteMinY;
+          int new_x = (int)((relX * screen_w) / spanX);
+          int new_y = (int)((relY * screen_h) / spanY);
+          /* Absolute devices report position, not delta — synthesize dX/dY
+           * from the change since last poll so the HUD isn't dead-zero. */
+          g_last_dx = new_x - *cursor_x;
+          g_last_dy = new_y - *cursor_y;
+          *cursor_x = new_x;
+          *cursor_y = new_y;
+        }
+        if (astate.ActiveButtons & 1) *curr_left_btn = TRUE;
+      }
+    }
+  }
+
+  {
+    static UINT64 poll_n = 0;
+    poll_n++;
+    if ((poll_n % 30) == 0) {
+      char dbg[220];
+      uprintf_str(dbg, sizeof(dbg),
+        "poll#%u simple=%u abs=%u pkts=%u relpkt=%u cx=%d cy=%d dx=%d dy=%d absSt=%u absCur=%u,%u\n",
+        poll_n, (UINT64)g_num_simple_pointers, (UINT64)g_num_abs_pointers, g_mouse_packets_count,
+        (UINT64)got_relative_packet, (INT64)*cursor_x, (INT64)*cursor_y, (INT64)g_last_dx, (INT64)g_last_dy,
+        (UINT64)g_last_abs_status, g_abs_cur_x, g_abs_cur_y);
+      serial_write_str(dbg);
     }
   }
 }
@@ -1819,6 +1899,12 @@ static void run_graphical_home_menu(EFI_HANDLE ImageHandle, EFI_GRAPHICS_OUTPUT_
 
   /* Comprehensive Pointer Protocols & PS/2 Hardware Driver Discovery */
   init_pointer_protocols(ImageHandle, bs);
+  {
+    char init_dbg[100];
+    uprintf_str(init_dbg, sizeof(init_dbg), "hwdiag: init_pointer_protocols -> simple=%u abs=%u\n",
+                (UINT64)g_num_simple_pointers, (UINT64)g_num_abs_pointers);
+    serial_write_str(init_dbg);
+  }
 
   int cursor_x = (int)screen_w / 2;
   int cursor_y = (int)screen_h / 2;
@@ -2014,15 +2100,20 @@ static void run_graphical_home_menu(EFI_HANDLE ImageHandle, EFI_GRAPHICS_OUTPUT_
       fb_draw_text(draw_fb, stride, screen_w, screen_h, buttons[i].x + 20, buttons[i].y + 38, buttons[i].subtext, 1, buttons[i].fg_subtext, 0, 0);
     }
 
-    /* Bottom Status Bar */
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, screen_h - 26, screen_w, 26, col_header_bg);
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, screen_h - 27, screen_w, 1, col_card_brd);
+    /* Bottom Status Bar (2 lines: general pointer stats + raw abs-pointer diag) */
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, screen_h - 42, screen_w, 42, col_header_bg);
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, screen_h - 43, screen_w, 1, col_card_brd);
 
     char status_str[160];
     uprintf_str(status_str, sizeof(status_str), "Pointers: (Simple:%u Abs:%u) | Pkts:%u | dX:%d dY:%d | Use Arrow Keys or Mouse",
                 (UINT64)g_num_simple_pointers, (UINT64)g_num_abs_pointers, g_mouse_packets_count, (INT64)g_last_dx, (INT64)g_last_dy);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, 20, screen_h - 36, status_str, 1, col_gray, 0, 0);
 
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, 20, screen_h - 20, status_str, 1, col_gray, 0, 0);
+    char abs_dbg_str[160];
+    uprintf_str(abs_dbg_str, sizeof(abs_dbg_str), "AbsDev[0]: St:%u X:%u..%u Cur%u  Y:%u..%u Cur%u",
+                (UINT64)g_last_abs_status, g_abs_min_x, g_abs_max_x, g_abs_cur_x,
+                g_abs_min_y, g_abs_max_y, g_abs_cur_y);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, 20, screen_h - 20, abs_dbg_str, 1, col_gray, 0, 0);
 
     /* Draw Mouse Cursor Pointer with click pulse visual */
     fb_draw_cursor(draw_fb, stride, screen_w, screen_h, cursor_x, cursor_y, col_white, col_black, curr_left_btn);
@@ -2048,6 +2139,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
   ST = SystemTable;
   bs = ST->BootServices;
+
+  serial_init();
+  serial_write_str("hwdiag: efi_main entered\n");
 
   if (bs && bs->SetWatchdogTimer) bs->SetWatchdogTimer(0, 0, 0, NULL);
 
