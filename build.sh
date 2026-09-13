@@ -151,6 +151,7 @@ QEMU_ARGS=(
   -device qemu-xhci,id=xhci
   -device usb-tablet,bus=xhci.0
   -serial stdio
+  -monitor unix:"$OUT/hwdiag-mon.sock",server,nowait
   -drive format=raw,file=fat:rw:"$ESP"
 )
 

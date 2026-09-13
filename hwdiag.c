@@ -101,7 +101,7 @@ static const EFI_GUID gEfiGlobalVariableGuid = GUID(
 static const EFI_GUID gEfiBlockIoProtocolGuid = GUID(
   0x964E5B21,0x6459,0x11D2, 0x8E,0x39,0x00,0xA0,0xC9,0x69,0x72,0x3B);
 static const EFI_GUID gEfiSimplePointerProtocolGuid = GUID(
-  0x31878C87,0x0B75,0x11D2, 0x9E,0x49,0x00,0xA0,0xC9,0x69,0x72,0x3B);
+  0x31878C87,0x0B75,0x11D5, 0x9A,0x4F,0x00,0x90,0x27,0x3F,0xC1,0x4D);
 static const EFI_GUID gEfiAbsolutePointerProtocolGuid = GUID(
   0x8D59D32B,0xC655,0x4AE9, 0x9B,0x15,0xF2,0x59,0x04,0x99,0x2A,0x43);
 
@@ -1904,6 +1904,34 @@ static void run_graphical_home_menu(EFI_HANDLE ImageHandle, EFI_GRAPHICS_OUTPUT_
     uprintf_str(init_dbg, sizeof(init_dbg), "hwdiag: init_pointer_protocols -> simple=%u abs=%u\n",
                 (UINT64)g_num_simple_pointers, (UINT64)g_num_abs_pointers);
     serial_write_str(init_dbg);
+  }
+
+  /* One-shot burst diagnostic: dump raw addresses and hammer GetState 100x
+   * back-to-back with zero delay, before the normal 60fps loop even starts.
+   * This tells us whether ANY call ever succeeds at all, independent of
+   * frame timing, and whether the pointers themselves look sane. */
+  if (g_num_abs_pointers > 0) {
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap0 = g_abs_pointers[0];
+    char adbg[220];
+    uprintf_str(adbg, sizeof(adbg), "burst: ap=%u Reset=%u GetState=%u Mode=%u\n",
+                (UINT64)(UINTN)ap0, (UINT64)(UINTN)(ap0 ? ap0->Reset : 0),
+                (UINT64)(UINTN)(ap0 ? ap0->GetState : 0), (UINT64)(UINTN)(ap0 ? ap0->Mode : 0));
+    serial_write_str(adbg);
+    UINTN j; UINTN successes = 0;
+    for (j = 0; j < 100 && ap0; j++) {
+      EFI_ABSOLUTE_POINTER_STATE bstate = {0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF};
+      EFI_STATUS bst = ap0->GetState(ap0, &bstate);
+      if (bst == EFI_SUCCESS) {
+        successes++;
+        char sdbg[160];
+        uprintf_str(sdbg, sizeof(sdbg), "burst: iter=%u SUCCESS x=%u y=%u btn=%u\n",
+                    j, bstate.CurrentX, bstate.CurrentY, (UINT64)bstate.ActiveButtons);
+        serial_write_str(sdbg);
+      }
+    }
+    char rdbg[100];
+    uprintf_str(rdbg, sizeof(rdbg), "burst: done, successes=%u/100\n", successes);
+    serial_write_str(rdbg);
   }
 
   int cursor_x = (int)screen_w / 2;
