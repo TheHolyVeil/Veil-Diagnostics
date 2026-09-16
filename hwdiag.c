@@ -1251,6 +1251,14 @@ static void set_best_text_mode(void) {
   }
 }
 
+/* Forward declarations: real definitions live in the Pager section and the
+ * Graphical UI Menu section further down the file, but easter_egg_donut()
+ * below (kept here for section-locality with the rest of the donut code)
+ * needs to call them for Back/Exit hit-testing and non-blocking key polling. */
+#define SCAN_ESC 0x17
+static EFI_INPUT_KEY read_key_nonblocking(void);
+static int point_in_rect(int px, int py, int rx, int ry, int rw, int rh);
+
 /* ========================================================================= */
 /* PC Speaker & Donut Animation                                              */
 /* ========================================================================= */
@@ -1267,12 +1275,22 @@ static void pcspeaker_on(UINT32 freq_hz) {
   outb(0x61, inb(0x61) | 0x03);
 }
 
+/* ~6s phrase (was ~2.75s) that resolves back onto the opening note (C5/523)
+ * so the loop-back doesn't read as an abrupt restart — the short rests
+ * (80ms) act as phrase breaks instead of the old single big trailing rest
+ * that made the repeat point obvious. */
 static const struct { UINT32 freq; UINT32 dur_ms; } donut_tune[] = {
   {523, 150}, {659, 150}, {784, 150}, {1047, 300},
   {880, 150}, {784, 150}, {659, 150}, {523, 300},
-  {0,   100},
-  {659, 150}, {784, 150}, {880, 150}, {1047, 400},
-  {0,   300},
+  {0,   80},
+  {587, 150}, {659, 150}, {784, 150}, {880, 300},
+  {784, 150}, {659, 150}, {587, 150}, {523, 300},
+  {0,   80},
+  {659, 150}, {784, 150}, {880, 150}, {1047, 300},
+  {1047,150}, {880, 150}, {784, 150}, {659, 300},
+  {0,   80},
+  {523, 150}, {659, 150}, {784, 150}, {659, 150},
+  {587, 150}, {523, 450},
 };
 #define DONUT_TUNE_LEN (sizeof(donut_tune) / sizeof(donut_tune[0]))
 
@@ -1291,7 +1309,14 @@ static void print_ascii_row_raw(const char *s) {
   wprint_raw(line);
 }
 
-static void render_donut_frame(float cosA, float sinA, float cosB, float sinB) {
+/* Pure math + rasterization into donut_out/donut_z. No console/ConOut side
+ * effects here on purpose — callers decide how (or whether) to display it.
+ * (Previously this function also did ST->ConOut->ClearScreen() + text-mode
+ * printing unconditionally, which ran even from the graphical branch and
+ * fought with the GOP framebuffer draw every frame — see donut_print_ascii
+ * below, which now owns that side effect and is only called from the
+ * text-fallback path.) */
+static void donut_compute(float cosA, float sinA, float cosB, float sinB) {
   const float R1 = 1.0f, R2 = 2.0f, K2 = 5.0f;
   const float K1 = (float)DONUT_W * K2 * 3.0f / (8.0f * (R1 + R2));
   UINTN x, y, pi, ti;
@@ -1314,6 +1339,12 @@ static void render_donut_frame(float cosA, float sinA, float cosB, float sinB) {
       float ooz = 1.0f / ze;
 
       int xp = (int)((float)DONUT_W / 2.0f + K1 * ooz * xw);
+      /* yfactor=0.5 confirmed correct via standalone projection sweep — a
+       * previous "fix" here removed this and used the same K1 for both
+       * axes, which looked right at some angles but computes a true row
+       * range of roughly [-4.5, 24.4] against this 22-row buffer at the
+       * default startup pose, i.e. genuinely clips off the top of the
+       * torus instead of tapering it. Reverted. */
       int yp = (int)((float)DONUT_H / 2.0f - 0.5f * K1 * ooz * yw);
 
       float L = cosPhi * cosTheta * sinB - cosA * cosTheta * sinPhi - sinA * sinTheta
@@ -1337,14 +1368,138 @@ static void render_donut_frame(float cosA, float sinA, float cosB, float sinB) {
     float nSinP = sinPhi * 0.999800007f + cosPhi * 0.019998667f;
     cosPhi = nCosP; sinPhi = nSinP;
   }
+}
 
+/* Text-mode-only side effect, split out of donut_compute(): clears and
+ * redraws the text console from the already-computed donut_out buffer.
+ * Call this ONLY from the no-GOP fallback path — the graphical path must
+ * never touch ConOut, or it'll fight the framebuffer draw for the display. */
+static void donut_print_ascii(void) {
+  UINTN y;
   ST->ConOut->ClearScreen(ST->ConOut);
   for (y = 0; y < DONUT_H; y++) print_ascii_row_raw(donut_out[y]);
   print_ascii_row_raw("(Press Esc, Enter, Space, Q, or Mouse Click to return)");
 }
 
-static void easter_egg_donut(EFI_BOOT_SERVICES *bs) {
-  float cosA = 1.0f, sinA = 0.0f, cosB = 1.0f, sinB = 0.0f;
+/* Map luminance index 0..11 to a color from near-black through cyan to white */
+static UINT32 donut_lum_color(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, int lum) {
+  /* 0: almost-bg, 1-3: dark blue, 4-6: mid blue/cyan, 7-9: bright cyan, 10-11: near-white */
+  static const UINT8 lum_r[12] = {15,  15,  30,  29,  56, 96, 125, 56, 38, 56, 224, 240};
+  static const UINT8 lum_g[12] = {23,  58,  58,  78, 189,165, 211,189,189,210, 242, 248};
+  static const UINT8 lum_b[12] = {42, 138, 138, 216, 248,250, 255,248,248,252, 254, 255};
+  if (lum < 0) lum = 0;
+  if (lum > 11) lum = 11;
+  return make_color_gop(gop, lum_r[lum], lum_g[lum], lum_b[lum]);
+}
+
+/* Render one donut frame onto the GOP framebuffer */
+static void render_donut_frame_gfx(
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop,
+  UINT32 *draw_fb, UINT32 stride, UINT32 screen_w, UINT32 screen_h,
+  int cursor_x, int cursor_y, BOOLEAN curr_left_btn,
+  int hov_back, int hov_exit,
+  int top_back_x, int top_back_y, int top_back_w, int top_back_h,
+  int top_exit_x, int top_exit_y, int top_exit_w, int top_exit_h)
+{
+  UINT32 col_bg       = make_color_gop(gop, 15,  23,  42);  /* #0F172A */
+  UINT32 col_topbar   = make_color_gop(gop, 15,  23,  42);
+  UINT32 col_border   = make_color_gop(gop, 51,  65,  85);  /* #334155 */
+  UINT32 col_cyan     = make_color_gop(gop, 56, 189, 248);  /* #38BDF8 */
+  UINT32 col_white    = make_color_gop(gop, 255,255, 255);
+  UINT32 col_gray     = make_color_gop(gop, 148,163, 184);  /* #94A3B8 */
+  UINT32 col_card     = make_color_gop(gop, 30,  41,  59);  /* #1E293B */
+  UINT32 col_btn_hov  = make_color_gop(gop, 59, 130, 246);  /* #3B82F6 */
+  UINT32 col_exit_norm= make_color_gop(gop, 153, 27,  27);  /* #991B1B */
+  UINT32 col_exit_hov = make_color_gop(gop, 220, 38,  38);  /* #DC2626 */
+  UINT32 col_black    = make_color_gop(gop, 0,    0,   0);
+
+  /* Background */
+  fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 0, screen_w, screen_h, col_bg);
+
+  /* Header bar */
+  fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 0, screen_w, 50, col_topbar);
+  fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 50, screen_w, 2, col_border);
+  fb_draw_text(draw_fb, stride, screen_w, screen_h, 120, 14, "3D SPINNING DONUT", 2, col_cyan, 0, 0);
+
+  /* < Back button */
+  fb_fill_rect(draw_fb, stride, screen_w, screen_h, top_back_x, top_back_y, top_back_w, top_back_h,
+               hov_back ? col_btn_hov : col_card);
+  fb_draw_rect(draw_fb, stride, screen_w, screen_h, top_back_x, top_back_y, top_back_w, top_back_h, 2, col_border);
+  fb_draw_text(draw_fb, stride, screen_w, screen_h, top_back_x + 14, top_back_y + 8, "< Back", 1, col_white, 0, 0);
+
+  /* [X] Exit button */
+  fb_fill_rect(draw_fb, stride, screen_w, screen_h, top_exit_x, top_exit_y, top_exit_w, top_exit_h,
+               hov_exit ? col_exit_hov : col_exit_norm);
+  fb_draw_rect(draw_fb, stride, screen_w, screen_h, top_exit_x, top_exit_y, top_exit_w, top_exit_h, 2, col_white);
+  fb_draw_text(draw_fb, stride, screen_w, screen_h, top_exit_x + 18, top_exit_y + 8, "[X] Exit", 1, col_white, 0, 0);
+
+  /* Centered donut text area — render each character with luminance color.
+   * Scale is derived from the actual screen size instead of a fixed 2x:
+   * a hardcoded scale=2 (1120x704px) was wider than the framebuffer on any
+   * GOP mode smaller than that (800x600, 1024x768, etc.), so the donut was
+   * silently getting clipped/cut off by the fb_pixel bounds checks. This
+   * picks the largest integer scale that still fits between the header and
+   * the bottom hint bar, so it fills the room on any resolution. */
+  int avail_w = (int)screen_w - 40;
+  int avail_h = (int)screen_h - 52 - 36 - 10;
+  int scale_w = avail_w / (DONUT_W * 8);
+  int scale_h = avail_h / (DONUT_H * 16);
+  int scale = (scale_w < scale_h) ? scale_w : scale_h;
+  if (scale < 1) scale = 1;
+  int char_pw = 8 * scale;
+  int char_ph = 16 * scale;
+  int donut_px_w = DONUT_W * char_pw;
+  int donut_px_h = DONUT_H * char_ph;
+  int donut_start_x = ((int)screen_w - donut_px_w) / 2;
+  int donut_start_y = 52 + ((int)(screen_h - 52 - 36) - donut_px_h) / 2;
+  if (donut_start_x < 0) donut_start_x = 0;
+  if (donut_start_y < 52) donut_start_y = 52;
+
+  {
+    UINTN row, col;
+    const char *lum_chars = ".,-~:;=!*#$@";
+    for (row = 0; row < DONUT_H; row++) {
+      for (col = 0; col < DONUT_W; col++) {
+        char c = donut_out[row][col];
+        if (c == ' ' || c == '\0') continue;
+        /* Find luminance index */
+        int lum = 0;
+        int li;
+        for (li = 0; li < 12; li++) {
+          if (lum_chars[li] == c) { lum = li; break; }
+        }
+        UINT32 col_char = donut_lum_color(gop, lum);
+        int px = donut_start_x + (int)col * char_pw;
+        int py = donut_start_y + (int)row * char_ph;
+        fb_draw_char(draw_fb, stride, screen_w, screen_h, px, py, c, scale, col_char, col_bg, 0);
+      }
+    }
+  }
+
+  /* Bottom hint */
+  fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, screen_h - 36, screen_w, 36, col_topbar);
+  fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, screen_h - 37, screen_w, 1, col_border);
+  fb_draw_text(draw_fb, stride, screen_w, screen_h, 20, screen_h - 26,
+    "Esc / Enter / Space / Q / Click = Back    [X] Exit = Quit", 1, col_gray, 0, 0);
+
+  /* Mouse cursor */
+  fb_draw_cursor(draw_fb, stride, screen_w, screen_h, cursor_x, cursor_y, col_white, col_black, curr_left_btn);
+}
+
+static int easter_egg_donut(EFI_BOOT_SERVICES *bs,
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT32 *fb, UINT32 *back_buf,
+  UINT32 stride, UINT32 screen_w, UINT32 screen_h,
+  int *cursor_x, int *cursor_y, BOOLEAN *prev_left_btn)
+{
+  /* Seed a mid-rotation pose instead of the flat identity (cosA=1,sinA=0,
+   * cosB=1,sinB=0). At the identity pose the torus's true row-range is
+   * only ~[3.3, 17.7] of the 22-row buffer — not clipped, but boxed into
+   * the middle with a hard-edged top and dead space around it, which is
+   * what actually looked "cut off" in testing. Every time the screen
+   * opens it reset to that exact pose, so it was the *first* frame you'd
+   * always see. This seed (~57°/~34° rotation already applied) renders
+   * as a properly filled, round torus immediately instead. */
+  float cosA = 0.5403f, sinA = 0.8415f, cosB = 0.8253f, sinB = 0.5646f;
   UINTN note_idx = 0;
   UINT64 note_elapsed_us = 0;
 
@@ -1354,44 +1509,119 @@ static void easter_egg_donut(EFI_BOOT_SERVICES *bs) {
     while (!EFI_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &dummy)));
   }
 
-  for (;;) {
-    if (DONUT_TUNE_LEN > 0) {
-      if (donut_tune[note_idx].freq > 0) pcspeaker_on(donut_tune[note_idx].freq);
-      else pcspeaker_off();
-    }
+  if (gop && fb) {
+    /* --- Graphical mode --- */
+    int top_back_x = 15, top_back_y = 10, top_back_w = 90, top_back_h = 32;
+    int top_exit_x = (int)screen_w - 110, top_exit_y = 10, top_exit_w = 95, top_exit_h = 32;
 
-    render_donut_frame(cosA, sinA, cosB, sinB);
-
-    /* Keyboard Exit Check */
-    if (ST->ConIn) {
-      EFI_INPUT_KEY key = {0, 0};
-      if (!EFI_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &key))) {
-        if (key.ScanCode != 0 || key.UnicodeChar != 0) break;
+    for (;;) {
+      if (DONUT_TUNE_LEN > 0) {
+        if (donut_tune[note_idx].freq > 0) pcspeaker_on(donut_tune[note_idx].freq);
+        else pcspeaker_off();
       }
+
+      /* Compute new frame — graphics path never touches ConOut. */
+      donut_compute(cosA, sinA, cosB, sinB);
+
+      BOOLEAN curr_left_btn = FALSE;
+      poll_pointer_inputs(screen_w, screen_h, cursor_x, cursor_y, &curr_left_btn);
+      BOOLEAN click_event = (curr_left_btn && !(*prev_left_btn));
+      *prev_left_btn = curr_left_btn;
+
+      /* Keyboard check */
+      EFI_INPUT_KEY key = read_key_nonblocking();
+      if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27 ||
+          key.UnicodeChar == L'\r' || key.UnicodeChar == L'\n' ||
+          key.UnicodeChar == L'q'  || key.UnicodeChar == L'Q'  ||
+          key.UnicodeChar == L' ') {
+        pcspeaker_off();
+        return 0;
+      }
+
+      int hov_back = point_in_rect(*cursor_x, *cursor_y, top_back_x, top_back_y, top_back_w, top_back_h);
+      int hov_exit = point_in_rect(*cursor_x, *cursor_y, top_exit_x, top_exit_y, top_exit_w, top_exit_h);
+
+      if (click_event) {
+        if (hov_back) { pcspeaker_off(); return 0; }
+        if (hov_exit) { pcspeaker_off(); return 1; }
+        /* click anywhere else also goes back */
+        pcspeaker_off();
+        return 0;
+      }
+
+      UINT32 *draw_fb = back_buf ? back_buf : fb;
+      render_donut_frame_gfx(gop, draw_fb, stride, screen_w, screen_h,
+        *cursor_x, *cursor_y, curr_left_btn,
+        hov_back, hov_exit,
+        top_back_x, top_back_y, top_back_w, top_back_h,
+        top_exit_x, top_exit_y, top_exit_w, top_exit_h);
+
+      if (back_buf) {
+        memcpy((void*)fb, (const void*)back_buf, (UINTN)screen_h * stride * sizeof(UINT32));
+      }
+
+      if (bs && bs->Stall) bs->Stall(33000);
+
+      note_elapsed_us += 33000;
+      if (DONUT_TUNE_LEN > 0 && note_elapsed_us >= (UINT64)donut_tune[note_idx].dur_ms * 1000) {
+        note_elapsed_us = 0;
+        note_idx = (note_idx + 1 < DONUT_TUNE_LEN) ? note_idx + 1 : 0;
+      }
+
+      float nCosA = cosA * 0.999200107f - sinA * 0.039989334f;
+      float nSinA = sinA * 0.999200107f + cosA * 0.039989334f;
+      cosA = nCosA; sinA = nSinA;
+      float nCosB = cosB * 0.999800007f - sinB * 0.019998667f;
+      float nSinB = sinB * 0.999800007f + cosB * 0.019998667f;
+      cosB = nCosB; sinB = nSinB;
     }
+  } else {
+    /* --- Text / fallback mode --- */
+    for (;;) {
+      if (DONUT_TUNE_LEN > 0) {
+        if (donut_tune[note_idx].freq > 0) pcspeaker_on(donut_tune[note_idx].freq);
+        else pcspeaker_off();
+      }
 
-    /* Mouse Click Exit Check */
-    BOOLEAN mouse_click = FALSE;
-    int dummy_x = 0, dummy_y = 0;
-    poll_pointer_inputs(800, 600, &dummy_x, &dummy_y, &mouse_click);
-    if (mouse_click) break;
+      /* Text fallback only: compute the frame, then explicitly render it
+       * to the text console. This is the ONLY place donut_print_ascii()
+       * (and therefore ConOut) is touched during donut playback. */
+      donut_compute(cosA, sinA, cosB, sinB);
+      donut_print_ascii();
 
-    if (bs && bs->Stall) bs->Stall(33000);
+      /* Keyboard Exit Check */
+      if (ST->ConIn) {
+        EFI_INPUT_KEY key = {0, 0};
+        if (!EFI_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &key))) {
+          if (key.ScanCode != 0 || key.UnicodeChar != 0) break;
+        }
+      }
 
-    note_elapsed_us += 33000;
-    if (DONUT_TUNE_LEN > 0 && note_elapsed_us >= (UINT64)donut_tune[note_idx].dur_ms * 1000) {
-      note_elapsed_us = 0;
-      note_idx = (note_idx + 1 < DONUT_TUNE_LEN) ? note_idx + 1 : 0;
+      /* Mouse Click Exit Check */
+      BOOLEAN mouse_click = FALSE;
+      int dummy_x = 0, dummy_y = 0;
+      poll_pointer_inputs(800, 600, &dummy_x, &dummy_y, &mouse_click);
+      if (mouse_click) break;
+
+      if (bs && bs->Stall) bs->Stall(33000);
+
+      note_elapsed_us += 33000;
+      if (DONUT_TUNE_LEN > 0 && note_elapsed_us >= (UINT64)donut_tune[note_idx].dur_ms * 1000) {
+        note_elapsed_us = 0;
+        note_idx = (note_idx + 1 < DONUT_TUNE_LEN) ? note_idx + 1 : 0;
+      }
+
+      float nCosA = cosA * 0.999200107f - sinA * 0.039989334f;
+      float nSinA = sinA * 0.999200107f + cosA * 0.039989334f;
+      cosA = nCosA; sinA = nSinA;
+      float nCosB = cosB * 0.999800007f - sinB * 0.019998667f;
+      float nSinB = sinB * 0.999800007f + cosB * 0.019998667f;
+      cosB = nCosB; sinB = nSinB;
     }
-
-    float nCosA = cosA * 0.999200107f - sinA * 0.039989334f;
-    float nSinA = sinA * 0.999200107f + cosA * 0.039989334f;
-    cosA = nCosA; sinA = nSinA;
-    float nCosB = cosB * 0.999800007f - sinB * 0.019998667f;
-    float nSinB = sinB * 0.999800007f + cosB * 0.019998667f;
-    cosB = nCosB; sinB = nSinB;
   }
+
   pcspeaker_off();
+  return 0;
 }
 
 /* ========================================================================= */
@@ -1440,9 +1670,14 @@ static EFI_INPUT_KEY read_key_nonblocking(void) {
   return key;
 }
 
-static void run_pager(EFI_BOOT_SERVICES *bs) {
-  UINTN line_count = 0, i, cols = 0, rows = 0, top, max_top, visible_rows, shown;
+static int run_pager(EFI_BOOT_SERVICES *bs,
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT32 *fb, UINT32 *back_buf,
+  UINT32 stride, UINT32 screen_w, UINT32 screen_h,
+  int *cursor_x, int *cursor_y, BOOLEAN *prev_left_btn)
+{
+  UINTN line_count = 0, i;
 
+  /* Build line index from outbuf */
   line_starts[line_count++] = 0;
   for (i = 0; i < outbuf_len && line_count < PAGER_MAX_LINES; i++) {
     if (outbuf[i] == L'\n' && i + 1 < outbuf_len) {
@@ -1450,62 +1685,223 @@ static void run_pager(EFI_BOOT_SERVICES *bs) {
     }
   }
 
-  if (!ST->ConOut || ST->ConOut->QueryMode(ST->ConOut, (UINTN)ST->ConOut->Mode->Mode, &cols, &rows) != 0 || rows < 3) {
-    rows = 25;
-  }
-  visible_rows = rows - 2;
-  max_top = (line_count > visible_rows) ? (line_count - visible_rows) : 0;
-  top = 0;
+  if (gop && fb) {
+    /* ------------------------------------------------------------------ */
+    /* Graphical pager                                                      */
+    /* ------------------------------------------------------------------ */
+    UINT32 col_bg        = make_color_gop(gop, 15,  23,  42);  /* #0F172A */
+    UINT32 col_topbar    = make_color_gop(gop, 15,  23,  42);
+    UINT32 col_border    = make_color_gop(gop, 51,  65,  85);  /* #334155 */
+    UINT32 col_white     = make_color_gop(gop, 255, 255, 255);
+    UINT32 col_gray      = make_color_gop(gop, 148, 163, 184); /* #94A3B8 */
+    UINT32 col_text      = make_color_gop(gop, 226, 232, 240); /* #E2E8F0 */
+    UINT32 col_card      = make_color_gop(gop, 30,  41,  59);  /* #1E293B */
+    UINT32 col_btn_hov   = make_color_gop(gop, 59, 130, 246);  /* #3B82F6 */
+    UINT32 col_exit_norm = make_color_gop(gop, 153, 27,  27);  /* #991B1B */
+    UINT32 col_exit_hov  = make_color_gop(gop, 220, 38,  38);  /* #DC2626 */
+    UINT32 col_scrolltrk = make_color_gop(gop, 30,  41,  59);  /* #1E293B */
+    UINT32 col_scrollthm = make_color_gop(gop, 148, 163, 184); /* #94A3B8 */
+    UINT32 col_black     = make_color_gop(gop, 0,    0,   0);
 
-  /* Flush key buffer before entering pager */
-  if (ST->ConIn) {
-    EFI_INPUT_KEY dummy;
-    while (!EFI_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &dummy)));
-  }
+    int top_back_x = 15, top_back_y = 10, top_back_w = 90, top_back_h = 32;
+    int top_exit_x = (int)screen_w - 110, top_exit_y = 10, top_exit_w = 95, top_exit_h = 32;
 
-  for (;;) {
-    ST->ConOut->ClearScreen(ST->ConOut);
-    shown = 0;
-    for (i = top; i < line_count && shown < visible_rows; i++, shown++) {
-      UINTN end = (i + 1 < line_count) ? line_starts[i + 1] : outbuf_len;
-      render_line(line_starts[i], end);
+    /* Text area geometry */
+    int text_y0 = 52;           /* below header+border */
+    int text_y1 = (int)screen_h - 38; /* above status bar */
+    int text_area_h = text_y1 - text_y0;
+    if (text_area_h < 18) text_area_h = 18;
+    int line_h = 18;            /* 16px font + 2px gap */
+    int visible_lines = text_area_h / line_h;
+    if (visible_lines < 1) visible_lines = 1;
+    int left_margin = 30;
+    int scroll_x = (int)screen_w - 14; /* scrollbar left edge */
+    int scroll_w = 12;
+    UINTN max_top = (line_count > (UINTN)visible_lines) ? (line_count - (UINTN)visible_lines) : 0;
+    UINTN top = 0;
+
+    /* Flush key buffer */
+    if (ST->ConIn) {
+      EFI_INPUT_KEY dummy;
+      while (!EFI_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &dummy)));
     }
 
-    wprint_raw(L"-- line ");
-    print_uint_raw(top + 1);
-    wprint_raw(L"-");
-    print_uint_raw(top + shown);
-    wprint_raw(L" of ");
-    print_uint_raw(line_count);
-    wprint_raw(L" | Up/Dn scroll, PgUp/PgDn page | Press Esc, Enter, Space, Q, or Click to Exit --");
+    for (;;) {
+      UINT32 *draw_fb = back_buf ? back_buf : fb;
+      BOOLEAN curr_left_btn = FALSE;
 
-    BOOLEAN exit_requested = FALSE;
-    EFI_INPUT_KEY key = read_key_nonblocking();
+      poll_pointer_inputs(screen_w, screen_h, cursor_x, cursor_y, &curr_left_btn);
+      BOOLEAN click_event = (curr_left_btn && !(*prev_left_btn));
+      *prev_left_btn = curr_left_btn;
 
-    if (key.ScanCode == SCAN_UP) {
-      if (top > 0) top--;
-    } else if (key.ScanCode == SCAN_DOWN) {
-      if (top < max_top) top++;
-    } else if (key.ScanCode == SCAN_PAGE_UP) {
-      top = (top > visible_rows) ? top - visible_rows : 0;
-    } else if (key.ScanCode == SCAN_PAGE_DOWN) {
-      top = (top + visible_rows < max_top) ? top + visible_rows : max_top;
-    } else if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27 ||
-               key.UnicodeChar == L'\r' || key.UnicodeChar == L'\n' ||
-               key.UnicodeChar == L'q'  || key.UnicodeChar == L'Q'  ||
-               key.UnicodeChar == L' '  || key.UnicodeChar == L'b'  || key.UnicodeChar == L'B') {
-      exit_requested = TRUE;
+      /* Keyboard */
+      EFI_INPUT_KEY key = read_key_nonblocking();
+      if (key.ScanCode == SCAN_UP) {
+        if (top > 0) top--;
+      } else if (key.ScanCode == SCAN_DOWN) {
+        if (top < max_top) top++;
+      } else if (key.ScanCode == SCAN_PAGE_UP) {
+        top = (top > (UINTN)visible_lines) ? top - (UINTN)visible_lines : 0;
+      } else if (key.ScanCode == SCAN_PAGE_DOWN) {
+        top = ((top + (UINTN)visible_lines) < max_top) ? top + (UINTN)visible_lines : max_top;
+      } else if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27 ||
+                 key.UnicodeChar == L'\r' || key.UnicodeChar == L'\n' ||
+                 key.UnicodeChar == L'q'  || key.UnicodeChar == L'Q'  ||
+                 key.UnicodeChar == L' '  || key.UnicodeChar == L'b'  || key.UnicodeChar == L'B') {
+        return 0;
+      }
+
+      int hov_back = point_in_rect(*cursor_x, *cursor_y, top_back_x, top_back_y, top_back_w, top_back_h);
+      int hov_exit = point_in_rect(*cursor_x, *cursor_y, top_exit_x, top_exit_y, top_exit_w, top_exit_h);
+
+      if (click_event) {
+        if (hov_back) return 0;
+        if (hov_exit) return 1;
+      }
+
+      /* --- Draw frame --- */
+
+      /* Background */
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 0, screen_w, screen_h, col_bg);
+
+      /* Header bar */
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 0, screen_w, 50, col_topbar);
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 50, screen_w, 2, col_border);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, 120, 14, "HARDWARE INFORMATION", 2, col_white, 0, 0);
+
+      /* Back button */
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, top_back_x, top_back_y, top_back_w, top_back_h,
+                   hov_back ? col_btn_hov : col_card);
+      fb_draw_rect(draw_fb, stride, screen_w, screen_h, top_back_x, top_back_y, top_back_w, top_back_h, 2, col_border);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, top_back_x + 14, top_back_y + 8, "< Back", 1, col_white, 0, 0);
+
+      /* Exit button */
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, top_exit_x, top_exit_y, top_exit_w, top_exit_h,
+                   hov_exit ? col_exit_hov : col_exit_norm);
+      fb_draw_rect(draw_fb, stride, screen_w, screen_h, top_exit_x, top_exit_y, top_exit_w, top_exit_h, 2, col_white);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, top_exit_x + 18, top_exit_y + 8, "[X] Exit", 1, col_white, 0, 0);
+
+      /* Scrollable text area */
+      {
+        UINTN shown_lines = 0;
+        UINTN li;
+        for (li = top; li < line_count && (int)shown_lines < visible_lines; li++, shown_lines++) {
+          UINTN ls = line_starts[li];
+          UINTN le = (li + 1 < line_count) ? line_starts[li + 1] : outbuf_len;
+          /* Convert CHAR16 line to char for fb_draw_text */
+          char line_buf[512];
+          UINTN n = 0, k;
+          for (k = ls; k < le && n < 510; k++) {
+            CHAR16 wc = outbuf[k];
+            if (wc == L'\r' || wc == L'\n') continue;
+            line_buf[n++] = (wc >= 32 && wc < 127) ? (char)(UINT8)wc : ' ';
+          }
+          line_buf[n] = '\0';
+          int py = text_y0 + (int)shown_lines * line_h;
+          fb_draw_text(draw_fb, stride, screen_w, screen_h, left_margin, py, line_buf, 1, col_text, col_bg, 0);
+        }
+      }
+
+      /* Scrollbar track */
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, scroll_x, text_y0, scroll_w, text_area_h, col_scrolltrk);
+      /* Scrollbar thumb */
+      if (line_count > 0) {
+        int thumb_h = (int)((UINT64)text_area_h * (UINT64)visible_lines / line_count);
+        if (thumb_h < 8) thumb_h = 8;
+        if (thumb_h > text_area_h) thumb_h = text_area_h;
+        int thumb_y = text_y0 + (int)((UINT64)(text_area_h - thumb_h) * top / (line_count > 1 ? line_count - 1 : 1));
+        fb_fill_rect(draw_fb, stride, screen_w, screen_h, scroll_x, thumb_y, scroll_w, thumb_h, col_scrollthm);
+      }
+
+      /* Bottom status bar */
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, (int)screen_h - 38, screen_w, 38, col_topbar);
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, (int)screen_h - 39, screen_w, 1, col_border);
+      {
+        UINTN shown_end = top + (UINTN)visible_lines;
+        if (shown_end > line_count) shown_end = line_count;
+        char status[220];
+        uprintf_str(status, sizeof(status),
+          "Line %u-%u of %u | Up/Dn Arrow: scroll | PgUp/PgDn: page | Esc/Click: Back",
+          (UINT64)(top + 1), (UINT64)shown_end, (UINT64)line_count);
+        fb_draw_text(draw_fb, stride, screen_w, screen_h, 20, (int)screen_h - 28, status, 1, col_gray, 0, 0);
+      }
+
+      /* Mouse cursor */
+      fb_draw_cursor(draw_fb, stride, screen_w, screen_h, *cursor_x, *cursor_y, col_white, col_black, curr_left_btn);
+
+      /* Blit back buffer */
+      if (back_buf) {
+        memcpy((void*)fb, (const void*)back_buf, (UINTN)screen_h * stride * sizeof(UINT32));
+      }
+
+      if (bs && bs->Stall) bs->Stall(16000);
+    }
+    return 0;
+
+  } else {
+    /* ------------------------------------------------------------------ */
+    /* Text / fallback pager (original ConOut implementation)              */
+    /* ------------------------------------------------------------------ */
+    UINTN cols = 0, rows = 0, top, max_top, visible_rows, shown;
+
+    if (!ST->ConOut || ST->ConOut->QueryMode(ST->ConOut, (UINTN)ST->ConOut->Mode->Mode, &cols, &rows) != 0 || rows < 3) {
+      rows = 25;
+    }
+    visible_rows = rows - 2;
+    max_top = (line_count > visible_rows) ? (line_count - visible_rows) : 0;
+    top = 0;
+
+    /* Flush key buffer before entering pager */
+    if (ST->ConIn) {
+      EFI_INPUT_KEY dummy;
+      while (!EFI_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &dummy)));
     }
 
-    /* Check mouse click to exit pager */
-    BOOLEAN mouse_click = FALSE;
-    int dummy_x = 0, dummy_y = 0;
-    poll_pointer_inputs(800, 600, &dummy_x, &dummy_y, &mouse_click);
-    if (mouse_click) exit_requested = TRUE;
+    for (;;) {
+      ST->ConOut->ClearScreen(ST->ConOut);
+      shown = 0;
+      for (i = top; i < line_count && shown < visible_rows; i++, shown++) {
+        UINTN end = (i + 1 < line_count) ? line_starts[i + 1] : outbuf_len;
+        render_line(line_starts[i], end);
+      }
 
-    if (exit_requested) break;
+      wprint_raw(L"-- line ");
+      print_uint_raw(top + 1);
+      wprint_raw(L"-");
+      print_uint_raw(top + shown);
+      wprint_raw(L" of ");
+      print_uint_raw(line_count);
+      wprint_raw(L" | Up/Dn scroll, PgUp/PgDn page | Press Esc, Enter, Space, Q, or Click to Exit --");
 
-    if (bs && bs->Stall) bs->Stall(20000);
+      BOOLEAN exit_requested = FALSE;
+      EFI_INPUT_KEY key = read_key_nonblocking();
+
+      if (key.ScanCode == SCAN_UP) {
+        if (top > 0) top--;
+      } else if (key.ScanCode == SCAN_DOWN) {
+        if (top < max_top) top++;
+      } else if (key.ScanCode == SCAN_PAGE_UP) {
+        top = (top > visible_rows) ? top - visible_rows : 0;
+      } else if (key.ScanCode == SCAN_PAGE_DOWN) {
+        top = (top + visible_rows < max_top) ? top + visible_rows : max_top;
+      } else if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27 ||
+                 key.UnicodeChar == L'\r' || key.UnicodeChar == L'\n' ||
+                 key.UnicodeChar == L'q'  || key.UnicodeChar == L'Q'  ||
+                 key.UnicodeChar == L' '  || key.UnicodeChar == L'b'  || key.UnicodeChar == L'B') {
+        exit_requested = TRUE;
+      }
+
+      /* Check mouse click to exit pager */
+      BOOLEAN mouse_click = FALSE;
+      int dummy_x = 0, dummy_y = 0;
+      poll_pointer_inputs(800, 600, &dummy_x, &dummy_y, &mouse_click);
+      if (mouse_click) exit_requested = TRUE;
+
+      if (exit_requested) break;
+
+      if (bs && bs->Stall) bs->Stall(20000);
+    }
+    return 0;
   }
 }
 
@@ -2029,10 +2425,10 @@ static void run_graphical_home_menu(EFI_HANDLE ImageHandle, EFI_GRAPHICS_OUTPUT_
       cursor_x += 15;
     } else if (key.UnicodeChar == L'1' || key.UnicodeChar == L'h' || key.UnicodeChar == L'H') {
       gather_hardware_info(ImageHandle);
-      run_pager(bs);
+      { int pret = run_pager(bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn); if (pret == 1) break; }
       continue;
     } else if (key.UnicodeChar == L'2' || key.UnicodeChar == L'd' || key.UnicodeChar == L'D') {
-      easter_egg_donut(bs);
+      { int dret = easter_egg_donut(bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn); if (dret == 1) break; }
       continue;
     } else if (key.UnicodeChar == L'3' || key.UnicodeChar == L'w' || key.UnicodeChar == L'W') {
       int ret = render_diagnostic_wip_screen(ImageHandle, bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn);
@@ -2043,10 +2439,10 @@ static void run_graphical_home_menu(EFI_HANDLE ImageHandle, EFI_GRAPHICS_OUTPUT_
     } else if (key.UnicodeChar == L'\r' || key.UnicodeChar == L' ') {
       if (selected_btn_idx == 0) {
         gather_hardware_info(ImageHandle);
-        run_pager(bs);
+        { int pret = run_pager(bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn); if (pret == 1) break; }
         continue;
       } else if (selected_btn_idx == 1) {
-        easter_egg_donut(bs);
+        { int dret = easter_egg_donut(bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn); if (dret == 1) break; }
         continue;
       } else if (selected_btn_idx == 2) {
         int ret = render_diagnostic_wip_screen(ImageHandle, bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn);
@@ -2074,10 +2470,10 @@ static void run_graphical_home_menu(EFI_HANDLE ImageHandle, EFI_GRAPHICS_OUTPUT_
       if (hover_exit) break; /* Exit application */
       if (selected_btn_idx == 0 && point_in_rect(cursor_x, cursor_y, buttons[0].x, buttons[0].y, buttons[0].w, buttons[0].h)) {
         gather_hardware_info(ImageHandle);
-        run_pager(bs);
+        { int pret = run_pager(bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn); if (pret == 1) break; }
         continue;
       } else if (selected_btn_idx == 1 && point_in_rect(cursor_x, cursor_y, buttons[1].x, buttons[1].y, buttons[1].w, buttons[1].h)) {
-        easter_egg_donut(bs);
+        { int dret = easter_egg_donut(bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn); if (dret == 1) break; }
         continue;
       } else if (selected_btn_idx == 2 && point_in_rect(cursor_x, cursor_y, buttons[2].x, buttons[2].y, buttons[2].w, buttons[2].h)) {
         int ret = render_diagnostic_wip_screen(ImageHandle, bs, gop, fb, back_buf, stride, screen_w, screen_h, &cursor_x, &cursor_y, &prev_left_btn);
@@ -2189,9 +2585,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* Launch Graphical Control Center Home Menu */
     run_graphical_home_menu(ImageHandle, gop);
   } else {
-    /* Fallback for pure text mode systems without GOP */
+    /* Fallback for pure text mode systems without GOP — pass NULLs for graphical params */
     gather_hardware_info(ImageHandle);
-    run_pager(bs);
+    {
+      int dummy_cx = 0, dummy_cy = 0;
+      BOOLEAN dummy_btn = FALSE;
+      run_pager(bs, NULL, NULL, NULL, 0, 0, 0, &dummy_cx, &dummy_cy, &dummy_btn);
+    }
   }
 
   if (ST->ConOut) {
