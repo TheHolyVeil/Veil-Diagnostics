@@ -17,83 +17,27 @@ OUT="$SCRIPT_DIR/build"
 EFI="$OUT/hwdiag.efi"
 mkdir -p "$OUT"
 
-CFLAGS_COMMON="-ffreestanding -fno-stack-protector -fno-stack-check -mno-red-zone -fno-builtin -O2 -Wall -Wextra"
+echo "=== Building with Zig (zig build -> x86_64-uefi) ==="
 
-echo "=== Toolchain Detection (Building for UEFI on Linux x86_64) ==="
-
-build_with_clang() {
-  command -v clang >/dev/null || return 1
-  command -v ld.lld >/dev/null || return 1
-
-  echo "Using: Clang + LLD (PE32+ UEFI Binary Target)"
-  # Target PE/COFF directly as mandated by UEFI Spec 2.x
-  # NOTE: this function is invoked as `if build_with_clang; then`, and bash
-  # suspends `set -e` for every command inside a function called that way —
-  # so the actual exit status has to be checked explicitly, or a failed
-  # compile/link here would still fall through to "return 0" and get
-  # reported as a successful build.
-  if clang --target=x86_64-unknown-windows-coff -fuse-ld=lld -nostdlib $CFLAGS_COMMON \
-    -Wl,-subsystem:efi_application -Wl,-entry:efi_main \
-    hwdiag.c -o "$EFI"; then
-    return 0
-  else
-    return 1
-  fi
-}
-
-build_with_mingw() {
-  command -v x86_64-w64-mingw32-gcc >/dev/null || return 1
-  echo "Using: MinGW Cross-GCC (PE32+ UEFI Output)"
-  x86_64-w64-mingw32-gcc -m64 -nostdlib $CFLAGS_COMMON -c hwdiag.c -o "$OUT/hwdiag.o"
-  x86_64-w64-mingw32-ld -m pei-x86-64 -nostdlib -e efi_main --subsystem=10 \
-    -o "$EFI" "$OUT/hwdiag.o"
-  return 0
-}
-
-build_with_gcc_objcopy() {
-  command -v gcc >/dev/null && command -v objcopy >/dev/null || return 1
-  echo "Using: Native Linux GCC + objcopy translation"
-  gcc -m64 $CFLAGS_COMMON -c hwdiag.c -o "$OUT/hwdiag.o"
-
-  cat >"$OUT/efi.lds" <<'EOF'
-SECTIONS {
-  . = 0;
-  ImageBase = .;
-  .text : { *(.text) *(.text.*) }
-  . = ALIGN(4096);
-  .data : { *(.data) *(.data.*) *(.rodata) *(.rodata.*) *(.data.rel.ro*) }
-  . = ALIGN(4096);
-  .dynamic : { *(.dynamic) }
-  . = ALIGN(4096);
-  .reloc : { *(.reloc) }
-  . = ALIGN(4096);
-  .symtab : { *(.symtab) }
-  .strtab : { *(.strtab) }
-  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.got) *(.got.plt) }
-}
-EOF
-  ld -m elf_x86_64 -nostdlib -shared -Bsymbolic -T "$OUT/efi.lds" \
-    -e efi_main -o "$OUT/hwdiag.so" "$OUT/hwdiag.o"
-  objcopy --target=efi-app-x86-64 "$OUT/hwdiag.so" "$EFI"
-  return 0
-}
-
-if build_with_clang; then
-  :
-elif build_with_mingw; then
-  :
-elif build_with_gcc_objcopy; then
-  :
-else
+command -v zig >/dev/null || {
   cat >&2 <<'EOF'
-ERROR: No usable toolchain found.
-Install Clang/LLD on your Linux system:
-  Debian/Ubuntu: sudo apt install clang lld
-  Arch Linux:    sudo pacman -S clang lld
-  Fedora:        sudo dnf install clang lld
+ERROR: zig is not installed.
+Install it (e.g. https://ziglang.org/download/, or your distro's zig package):
+  Arch/CachyOS:  sudo pacman -S zig
 EOF
   exit 1
-fi
+}
+
+# zig build fails loudly (non-zero exit) on real compile/link errors, and
+# `set -euo pipefail` above means that failure aborts this script here —
+# unlike the old hand-rolled clang/mingw/gcc_objcopy toolchain chain, there
+# is no path left where a failed compile still reaches "Build Complete".
+zig build \
+  --prefix "$OUT" \
+  --cache-dir "$OUT/.zig-cache" \
+  --global-cache-dir "$OUT/.zig-global-cache"
+
+cp -f "$OUT/bin/hwdiag.efi" "$EFI"
 
 echo "=== Build Complete ==="
 file "$EFI" || true
