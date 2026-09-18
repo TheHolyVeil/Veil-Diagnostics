@@ -10,37 +10,47 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 BUILD_ONLY=0
-[ "${1:-}" = "--build-only" ] && BUILD_ONLY=1
+COPY_EFI=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --build-only) BUILD_ONLY=1 ;;
+    --copy)       COPY_EFI=1 ;;
+  esac
+done
 
 # All assets, temporary mounts, and outputs live strictly inside ./build
 OUT="$SCRIPT_DIR/build"
 EFI="$OUT/hwdiag.efi"
 mkdir -p "$OUT"
 
-echo "=== Building with Zig (zig build -> x86_64-uefi) ==="
+echo "=== Building with Makefile (make -> hwdiag.efi) ==="
+
+command -v make >/dev/null || {
+  echo "ERROR: make is not installed." >&2
+  exit 1
+}
 
 command -v zig >/dev/null || {
   cat >&2 <<'EOF'
-ERROR: zig is not installed.
+ERROR: zig is not installed (required for zig cc compiler driver).
 Install it (e.g. https://ziglang.org/download/, or your distro's zig package):
   Arch/CachyOS:  sudo pacman -S zig
 EOF
   exit 1
 }
 
-# zig build fails loudly (non-zero exit) on real compile/link errors, and
-# `set -euo pipefail` above means that failure aborts this script here —
-# unlike the old hand-rolled clang/mingw/gcc_objcopy toolchain chain, there
-# is no path left where a failed compile still reaches "Build Complete".
-zig build \
-  --prefix "$OUT" \
-  --cache-dir "$OUT/.zig-cache" \
-  --global-cache-dir "$OUT/.zig-global-cache"
-
-cp -f "$OUT/bin/hwdiag.efi" "$EFI"
+make
 
 echo "=== Build Complete ==="
 file "$EFI" || true
+
+if [ "$COPY_EFI" = "1" ]; then
+  echo "=== Copying $EFI to /boot/EFI/hwdiag.efi via sudo cp ==="
+  sudo mkdir -p /boot/EFI
+  sudo cp -f "$EFI" /boot/EFI/hwdiag.efi
+  echo "Successfully copied to /boot/EFI/hwdiag.efi"
+fi
 
 [ "$BUILD_ONLY" = "1" ] && {
   echo "Saved to $EFI"

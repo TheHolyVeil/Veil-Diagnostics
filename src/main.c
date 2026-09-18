@@ -6,7 +6,7 @@
 #include "ui.h"
 
 /* ---- CRT symbol required for floating-point ----------------------------- */
-int _fltused = 1;
+__attribute__((used)) int _fltused = 1;
 
 static void set_best_text_mode(void) {
   if (!ST->ConOut || !ST->ConOut->Mode) return;

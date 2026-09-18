@@ -2,8 +2,19 @@
 #define GFX_H
 #include "efi_types.h"
 
-UINT32 make_color_gop(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT8 r, UINT8 g, UINT8 b);
-void fb_pixel(UINT32 *fb, UINT32 stride, UINT32 w, UINT32 h, int x, int y, UINT32 color);
+static inline UINT32 make_color_gop(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT8 r, UINT8 g, UINT8 b) {
+  if (gop && gop->Mode && gop->Mode->Info && gop->Mode->Info->PixelFormat == PIXEL_RGB_RESERVED_8BIT_PER_COLOR) {
+    return (UINT32)r | ((UINT32)g << 8) | ((UINT32)b << 16);
+  }
+  return (UINT32)b | ((UINT32)g << 8) | ((UINT32)r << 16);
+}
+
+static inline void fb_pixel(UINT32 *fb, UINT32 stride, UINT32 w, UINT32 h, int x, int y, UINT32 color) {
+  if ((UINT32)x < w && (UINT32)y < h) {
+    fb[(UINT32)y * stride + (UINT32)x] = color;
+  }
+}
+
 void fb_fill_rect(UINT32 *fb, UINT32 stride, UINT32 w, UINT32 h, int rx, int ry, int rw, int rh, UINT32 color);
 void fb_draw_rect(UINT32 *fb, UINT32 stride, UINT32 w, UINT32 h, int rx, int ry, int rw, int rh, int border, UINT32 color);
 void fb_draw_char(UINT32 *fb, UINT32 stride, UINT32 w, UINT32 h, int x, int y, char c, int scale, UINT32 fg, UINT32 bg, int draw_bg);

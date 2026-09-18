@@ -39,9 +39,9 @@ static const struct { UINT32 freq; UINT32 dur_ms; } donut_tune[] = {
 #define DONUT_TUNE_LEN (sizeof(donut_tune) / sizeof(donut_tune[0]))
 
 #define DONUT_W 70
-#define DONUT_H 22
-static char  donut_out[DONUT_H][DONUT_W + 1];
-static float donut_z[DONUT_H][DONUT_W];
+#define DONUT_HEIGHT 22
+static char  donut_out[DONUT_HEIGHT][DONUT_W + 1];
+static float donut_z[DONUT_HEIGHT][DONUT_W];
 
 static void print_ascii_row_raw(const char *s) {
   CHAR16 line[DONUT_W + 3];
@@ -66,7 +66,7 @@ static void donut_compute(float cosA, float sinA, float cosB, float sinB) {
   UINTN x, y, pi, ti;
   float cosPhi = 1.0f, sinPhi = 0.0f;
 
-  for (y = 0; y < DONUT_H; y++) {
+  for (y = 0; y < DONUT_HEIGHT; y++) {
     for (x = 0; x < DONUT_W; x++) { donut_out[y][x] = ' '; donut_z[y][x] = 0.0f; }
     donut_out[y][DONUT_W] = 0;
   }
@@ -89,12 +89,12 @@ static void donut_compute(float cosA, float sinA, float cosB, float sinB) {
        * range of roughly [-4.5, 24.4] against this 22-row buffer at the
        * default startup pose, i.e. genuinely clips off the top of the
        * torus instead of tapering it. Reverted. */
-      int yp = (int)((float)DONUT_H / 2.0f - 0.5f * K1 * ooz * yw);
+      int yp = (int)((float)DONUT_HEIGHT / 2.0f - 0.5f * K1 * ooz * yw);
 
       float L = cosPhi * cosTheta * sinB - cosA * cosTheta * sinPhi - sinA * sinTheta
                + cosB * (cosA * sinTheta - cosTheta * sinA * sinPhi);
 
-      if (xp >= 0 && xp < DONUT_W && yp >= 0 && yp < DONUT_H && L > 0.0f) {
+      if (xp >= 0 && xp < DONUT_W && yp >= 0 && yp < DONUT_HEIGHT && L > 0.0f) {
         if (ooz > donut_z[yp][xp]) {
           int lum = (int)(L * 8.0f);
           if (lum > 11) lum = 11;
@@ -121,7 +121,7 @@ static void donut_compute(float cosA, float sinA, float cosB, float sinB) {
 static void donut_print_ascii(void) {
   UINTN y;
   ST->ConOut->ClearScreen(ST->ConOut);
-  for (y = 0; y < DONUT_H; y++) print_ascii_row_raw(donut_out[y]);
+  for (y = 0; y < DONUT_HEIGHT; y++) print_ascii_row_raw(donut_out[y]);
   print_ascii_row_raw("(Press Esc, Enter, Space, Q, or Mouse Click to return)");
 }
 
@@ -187,13 +187,13 @@ static void render_donut_frame_gfx(
   int avail_w = (int)screen_w - 40;
   int avail_h = (int)screen_h - 52 - 36 - 10;
   int scale_w = avail_w / (DONUT_W * 8);
-  int scale_h = avail_h / (DONUT_H * 16);
+  int scale_h = avail_h / (DONUT_HEIGHT * 16);
   int scale = (scale_w < scale_h) ? scale_w : scale_h;
   if (scale < 1) scale = 1;
   int char_pw = 8 * scale;
   int char_ph = 16 * scale;
   int donut_px_w = DONUT_W * char_pw;
-  int donut_px_h = DONUT_H * char_ph;
+  int donut_px_h = DONUT_HEIGHT * char_ph;
   int donut_start_x = ((int)screen_w - donut_px_w) / 2;
   int donut_start_y = 52 + ((int)(screen_h - 52 - 36) - donut_px_h) / 2;
   if (donut_start_x < 0) donut_start_x = 0;
@@ -202,7 +202,7 @@ static void render_donut_frame_gfx(
   {
     UINTN row, col;
     const char *lum_chars = ".,-~:;=!*#$@";
-    for (row = 0; row < DONUT_H; row++) {
+    for (row = 0; row < DONUT_HEIGHT; row++) {
       for (col = 0; col < DONUT_W; col++) {
         char c = donut_out[row][col];
         if (c == ' ' || c == '\0') continue;

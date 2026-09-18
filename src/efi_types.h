@@ -106,7 +106,7 @@ static const EFI_GUID gEfiSimplePointerProtocolGuid = GUID(
 static const EFI_GUID gEfiAbsolutePointerProtocolGuid = GUID(
   0x8D59D32B,0xC655,0x4AE9, 0x9B,0x15,0xF2,0x59,0x04,0x99,0x2A,0x43);
 
-static int guid_equal(const EFI_GUID *a, const EFI_GUID *b) {
+static inline int guid_equal(const EFI_GUID *a, const EFI_GUID *b) {
   const UINT8 *x = (const UINT8*)a, *y = (const UINT8*)b;
   int i;
   for (i = 0; i < 16; i++) if (x[i] != y[i]) return 0;

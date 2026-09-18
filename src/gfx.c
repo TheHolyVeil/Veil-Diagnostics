@@ -109,18 +109,7 @@ static const UINT8 font8x16[95][16] = {
 /* ========================================================================= */
 /* Graphics Rendering Primitives                                             */
 /* ========================================================================= */
-UINT32 make_color_gop(EFI_GRAPHICS_OUTPUT_PROTOCOL *gop, UINT8 r, UINT8 g, UINT8 b) {
-  if (gop && gop->Mode && gop->Mode->Info && gop->Mode->Info->PixelFormat == PIXEL_RGB_RESERVED_8BIT_PER_COLOR) {
-    return (UINT32)r | ((UINT32)g << 8) | ((UINT32)b << 16);
-  }
-  return (UINT32)b | ((UINT32)g << 8) | ((UINT32)r << 16);
-}
 
-void fb_pixel(UINT32 *fb, UINT32 stride, UINT32 w, UINT32 h, int x, int y, UINT32 color) {
-  if (x >= 0 && (UINT32)x < w && y >= 0 && (UINT32)y < h) {
-    fb[(UINT32)y * stride + (UINT32)x] = color;
-  }
-}
 
 void fb_fill_rect(UINT32 *fb, UINT32 stride, UINT32 w, UINT32 h, int rx, int ry, int rw, int rh, UINT32 color) {
   int x, y;
