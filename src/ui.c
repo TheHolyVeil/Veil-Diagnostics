@@ -5,6 +5,7 @@
 #include "cpu_hwinfo.h"
 #include "ram_test.h"
 #include "interactive_tests.h"
+#include "smart_test.h"
 #include "ui.h"
 
 /* ========================================================================= */
@@ -288,6 +289,67 @@ typedef struct {
 
 
 /* ========================================================================= */
+/* RAM Test Pool Allocation                                                   */
+/* ========================================================================= */
+/* Walks the UEFI memory map for the largest EfiConventionalMemory block and
+ * grabs a real chunk of it via AllocatePages, instead of a fixed 64 MB
+ * AllocatePool call. Capped so the interactive stall-based test loop finishes
+ * in a reasonable time on machines with a lot of RAM; leaves headroom in the
+ * source block for the firmware/OS loader rather than draining it entirely. */
+#define RAM_TEST_CAP_BYTES   (512ULL * 1024 * 1024)
+#define RAM_TEST_MIN_BYTES   (4ULL   * 1024 * 1024)
+#define RAM_TEST_HEADROOM_PAGES 256  /* 1 MB left behind in the source block */
+
+static void *alloc_ram_test_pool(EFI_BOOT_SERVICES *bs, UINTN *out_bytes) {
+  *out_bytes = 0;
+  if (!bs || !bs->GetMemoryMap || !bs->AllocatePool || !bs->FreePool || !bs->AllocatePages) {
+    return NULL;
+  }
+
+  UINTN mapsize = 0, mapkey = 0, descsize = 0;
+  UINT32 descver = 0;
+  VOID *mmap = NULL;
+  EFI_STATUS s = bs->GetMemoryMap(&mapsize, NULL, &mapkey, &descsize, &descver);
+  if (EFI_ERROR(s) && s != EFI_BUFFER_TOO_SMALL) return NULL;
+  mapsize += 2 * descsize + 64;
+  if (EFI_ERROR(bs->AllocatePool(EFI_LOADER_DATA, mapsize, &mmap))) return NULL;
+
+  s = bs->GetMemoryMap(&mapsize, mmap, &mapkey, &descsize, &descver);
+  if (EFI_ERROR(s)) { bs->FreePool(mmap); return NULL; }
+
+  UINT64 largest_pages = 0;
+  for (UINT8 *p = (UINT8*)mmap; p < (UINT8*)mmap + mapsize; p += descsize) {
+    EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR*)p;
+    if (d->Type == EFI_CONVENTIONAL_MEMORY && d->NumberOfPages > largest_pages) {
+      largest_pages = d->NumberOfPages;
+    }
+  }
+  bs->FreePool(mmap);
+
+  if (largest_pages <= RAM_TEST_HEADROOM_PAGES) return NULL;
+  UINT64 usable_pages = largest_pages - RAM_TEST_HEADROOM_PAGES;
+
+  UINT64 cap_pages = RAM_TEST_CAP_BYTES / 4096;
+  UINT64 want_pages = usable_pages > cap_pages ? cap_pages : usable_pages;
+  UINT64 min_pages  = RAM_TEST_MIN_BYTES / 4096;
+  if (want_pages < min_pages) want_pages = usable_pages; /* take what's there */
+  if (want_pages == 0) return NULL;
+
+  EFI_PHYSICAL_ADDRESS phys = 0;
+  if (EFI_ERROR(bs->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, (UINTN)want_pages, &phys))) {
+    /* Block might be fragmented from BS bookkeeping since the probe; retry smaller */
+    want_pages /= 2;
+    if (want_pages < min_pages) return NULL;
+    if (EFI_ERROR(bs->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, (UINTN)want_pages, &phys))) {
+      return NULL;
+    }
+  }
+
+  *out_bytes = (UINTN)(want_pages * 4096);
+  return (void*)(UINTN)phys;
+}
+
+/* ========================================================================= */
 /* Zig RAM Test & Diagnostic Suite Screen                                     */
 /* ========================================================================= */
 static int run_zig_ram_test_screen(
@@ -310,15 +372,11 @@ static int run_zig_ram_test_screen(
   UINT32 col_exit_norm= make_color_gop(gop, 153, 27, 27);  /* #991B1B */
   UINT32 col_exit_hov = make_color_gop(gop, 220, 38, 38);  /* #DC2626 */
 
-  /* Allocate 64 MB RAM test pool via UEFI BootServices AllocatePool */
-  UINTN test_bytes = 64 * 1024 * 1024;
-  void *mem_pool = NULL;
-  if (bs && bs->AllocatePool) {
-    if (EFI_ERROR(bs->AllocatePool(EFI_LOADER_DATA, test_bytes, &mem_pool))) {
-      test_bytes = 16 * 1024 * 1024;
-      bs->AllocatePool(EFI_LOADER_DATA, test_bytes, &mem_pool);
-    }
-  }
+  /* Grab a real slice of the largest free conventional-memory block (up to
+   * RAM_TEST_CAP_BYTES) via AllocatePages, instead of a fixed 64 MB pool. */
+  UINTN test_bytes = 0;
+  void *mem_pool = alloc_ram_test_pool(bs, &test_bytes);
+  UINTN test_pages = test_bytes / 4096;
 
   RamTestState state;
   memset(&state, 0, sizeof(state));
@@ -353,7 +411,7 @@ static int run_zig_ram_test_screen(
       break;
     }
     if (key.UnicodeChar == L'x' || key.UnicodeChar == L'X') {
-      if (mem_pool && bs && bs->FreePool) bs->FreePool(mem_pool);
+      if (mem_pool && bs && bs->FreePages) bs->FreePages((EFI_PHYSICAL_ADDRESS)(UINTN)mem_pool, test_pages);
       return 1;
     }
     if (key.UnicodeChar == L'r' || key.UnicodeChar == L'R') {
@@ -377,7 +435,7 @@ static int run_zig_ram_test_screen(
     if (click_event) {
       if (hov_back_top || hov_back_main) break;
       if (hov_exit_top) {
-        if (mem_pool && bs && bs->FreePool) bs->FreePool(mem_pool);
+        if (mem_pool && bs && bs->FreePages) bs->FreePages((EFI_PHYSICAL_ADDRESS)(UINTN)mem_pool, test_pages);
         return 1;
       }
     }
@@ -471,7 +529,7 @@ static int run_zig_ram_test_screen(
     if (bs && bs->Stall) bs->Stall(16000);
   }
 
-  if (mem_pool && bs && bs->FreePool) bs->FreePool(mem_pool);
+  if (mem_pool && bs && bs->FreePages) bs->FreePages((EFI_PHYSICAL_ADDRESS)(UINTN)mem_pool, test_pages);
   return 0;
 }
 
@@ -868,6 +926,245 @@ static int run_pc_speaker_audio_screen(
 }
 
 /* Render Redesigned Diagnostic Suite Screen */
+typedef int (*DiagTestFn)(
+  EFI_BOOT_SERVICES *bs, EFI_GRAPHICS_OUTPUT_PROTOCOL *gop,
+  UINT32 *fb, UINT32 *back_buf, UINT32 stride, UINT32 screen_w, UINT32 screen_h,
+  int *cursor_x, int *cursor_y, BOOLEAN *prev_left_btn);
+
+/* ========================================================================= */
+/* Zig SMART Storage Drive Diagnostics & Self-Test Screen                    */
+/* ========================================================================= */
+static int run_smart_test_screen(
+  EFI_BOOT_SERVICES *bs,
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop,
+  UINT32 *fb, UINT32 *back_buf, UINT32 stride, UINT32 screen_w, UINT32 screen_h,
+  int *cursor_x, int *cursor_y, BOOLEAN *prev_left_btn)
+{
+  UINT32 col_bg       = make_color_gop(gop, 15, 23, 42);   /* #0F172A */
+  UINT32 col_card     = make_color_gop(gop, 30, 41, 59);   /* #1E293B */
+  UINT32 col_topbar   = make_color_gop(gop, 15, 23, 42);   /* Top bar bg */
+  UINT32 col_border   = make_color_gop(gop, 51, 65, 85);   /* #334155 */
+  UINT32 col_cyan     = make_color_gop(gop, 56, 189, 248); /* #38BDF8 */
+  UINT32 col_green    = make_color_gop(gop, 34, 197, 94);  /* #22C55E */
+  UINT32 col_yellow   = make_color_gop(gop, 234, 179, 8);  /* #EAB308 */
+  UINT32 col_red      = make_color_gop(gop, 239, 68, 68);  /* #EF4444 */
+  UINT32 col_white    = make_color_gop(gop, 255, 255, 255);
+  UINT32 col_gray     = make_color_gop(gop, 148, 163, 184);/* #94A3B8 */
+  UINT32 col_btn_bg   = make_color_gop(gop, 37, 99, 235);  /* #2563EB */
+  UINT32 col_btn_hov  = make_color_gop(gop, 59, 130, 246); /* #3B82F6 */
+  UINT32 col_exit_norm= make_color_gop(gop, 153, 27, 27);  /* #991B1B */
+  UINT32 col_exit_hov = make_color_gop(gop, 220, 38, 38);  /* #DC2626 */
+
+  SmartTestState state;
+  memset(&state, 0, sizeof(state));
+  smart_test_init(&state, bs);
+
+  int top_back_x = 15, top_back_y = 10, top_back_w = 90, top_back_h = 32;
+  int top_exit_x = (int)screen_w - 110, top_exit_y = 10, top_exit_w = 95, top_exit_h = 32;
+
+  int card_w = 760, card_h = 510;
+  int card_x = ((int)screen_w - card_w) / 2;
+  int card_y = ((int)screen_h - card_h) / 2 + 10;
+
+  int btn_w = 130, btn_h = 36;
+  int btn1_x = card_x + 20,                  btn1_y = card_y + card_h - 50;
+  int btn2_x = card_x + 20 + btn_w + 15,     btn2_y = btn1_y;
+  int btn3_x = card_x + 20 + (btn_w + 15)*2, btn3_y = btn1_y;
+  int btn4_x = card_x + 20 + (btn_w + 15)*3, btn4_y = btn1_y;
+  int btn5_x = card_x + 20 + (btn_w + 15)*4, btn5_y = btn1_y;
+
+  for (;;) {
+    UINT32 *draw_fb = back_buf ? back_buf : fb;
+    BOOLEAN curr_left_btn = FALSE;
+
+    /* Driver API state machine step */
+    smart_test_step(&state, bs);
+
+    poll_pointer_inputs(screen_w, screen_h, cursor_x, cursor_y, &curr_left_btn);
+    BOOLEAN click_event = (curr_left_btn && !(*prev_left_btn));
+    *prev_left_btn = curr_left_btn;
+
+    EFI_INPUT_KEY key = read_key_nonblocking();
+    if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27 || key.UnicodeChar == L'b' || key.UnicodeChar == L'B') {
+      break;
+    }
+    if (key.UnicodeChar == L'x' || key.UnicodeChar == L'X') {
+      return 1;
+    }
+    if (key.UnicodeChar == L'1') smart_test_send_command(&state, SMART_CMD_NEXT_DRIVE);
+    if (key.UnicodeChar == L'2') smart_test_send_command(&state, SMART_CMD_SHORT_TEST);
+    if (key.UnicodeChar == L'3') smart_test_send_command(&state, SMART_CMD_EXTENDED_TEST);
+    if (key.UnicodeChar == L'4') smart_test_send_command(&state, SMART_CMD_REFRESH);
+    if (key.UnicodeChar == L'5' || key.UnicodeChar == L'a' || key.UnicodeChar == L'A') smart_test_send_command(&state, SMART_CMD_ABORT);
+
+    if (key.ScanCode == SCAN_UP)    *cursor_y -= 15;
+    if (key.ScanCode == SCAN_DOWN)  *cursor_y += 15;
+    if (key.ScanCode == SCAN_LEFT)  *cursor_x -= 15;
+    if (key.ScanCode == SCAN_RIGHT) *cursor_x += 15;
+
+    if (*cursor_x < 0) *cursor_x = 0;
+    if (*cursor_y < 0) *cursor_y = 0;
+    if (*cursor_x >= (int)screen_w) *cursor_x = (int)screen_w - 1;
+    if (*cursor_y >= (int)screen_h) *cursor_y = (int)screen_h - 1;
+
+    int hov_back_top = point_in_rect(*cursor_x, *cursor_y, top_back_x, top_back_y, top_back_w, top_back_h);
+    int hov_exit_top = point_in_rect(*cursor_x, *cursor_y, top_exit_x, top_exit_y, top_exit_w, top_exit_h);
+
+    int hov_btn1 = point_in_rect(*cursor_x, *cursor_y, btn1_x, btn1_y, btn_w, btn_h);
+    int hov_btn2 = point_in_rect(*cursor_x, *cursor_y, btn2_x, btn2_y, btn_w, btn_h);
+    int hov_btn3 = point_in_rect(*cursor_x, *cursor_y, btn3_x, btn3_y, btn_w, btn_h);
+    int hov_btn4 = point_in_rect(*cursor_x, *cursor_y, btn4_x, btn4_y, btn_w, btn_h);
+    int hov_btn5 = point_in_rect(*cursor_x, *cursor_y, btn5_x, btn5_y, btn_w, btn_h);
+
+    if (click_event) {
+      if (hov_back_top) break;
+      if (hov_exit_top) return 1;
+      if (hov_btn1) smart_test_send_command(&state, SMART_CMD_NEXT_DRIVE);
+      if (hov_btn2) smart_test_send_command(&state, SMART_CMD_SHORT_TEST);
+      if (hov_btn3) smart_test_send_command(&state, SMART_CMD_EXTENDED_TEST);
+      if (hov_btn4) smart_test_send_command(&state, SMART_CMD_REFRESH);
+      if (hov_btn5) smart_test_send_command(&state, SMART_CMD_ABORT);
+    }
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 0, screen_w, screen_h, col_bg);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 0, screen_w, 50, col_topbar);
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, 0, 50, screen_w, 2, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, 120, 14, "SMART DRIVE DIAGNOSTICS [ZIG ENGINE]", 2, col_cyan, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, top_back_x, top_back_y, top_back_w, top_back_h, hov_back_top ? col_btn_hov : col_btn_bg);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, top_back_x, top_back_y, top_back_w, top_back_h, 1, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, top_back_x + 15, top_back_y + 8, "< Back", 1, col_white, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, top_exit_x, top_exit_y, top_exit_w, top_exit_h, hov_exit_top ? col_exit_hov : col_exit_norm);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, top_exit_x, top_exit_y, top_exit_w, top_exit_h, 1, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, top_exit_x + 18, top_exit_y + 8, "Exit [X]", 1, col_white, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, card_x, card_y, card_w, card_h, col_card);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, card_x, card_y, card_w, card_h, 1, col_border);
+
+    SmartDriveInfo *active_drv = &state.drives[state.active_drive_idx];
+
+    char drv_title[64];
+    uprintf_str(drv_title, sizeof(drv_title), "TARGET DRIVE [%u/%u]: %s", state.active_drive_idx + 1, state.drive_count, active_drv->model);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 20, card_y + 15, drv_title, 1, col_cyan, 0, 0);
+
+    char drv_meta[128];
+    const char *type_str = active_drv->drive_type == 1 ? "NVMe Express" : (active_drv->drive_type == 0 ? "SATA/AHCI" : "UEFI BlockIO");
+    uprintf_str(drv_meta, sizeof(drv_meta), "Cap: %u MB | Type: %s | S/N: %s | Sector: %uB", 
+                (UINT32)active_drv->total_capacity_mb, type_str, active_drv->serial, active_drv->block_size);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 20, card_y + 32, drv_meta, 1, col_gray, 0, 0);
+
+    UINT32 badge_col = col_green;
+    const char *health_text = "PASSED";
+    if (active_drv->overall_health == 2) { badge_col = col_yellow; health_text = "WARNING"; }
+    else if (active_drv->overall_health == 3) { badge_col = col_red; health_text = "FAILED"; }
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, card_x + card_w - 120, card_y + 15, 100, 24, badge_col);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + card_w - 110, card_y + 20, health_text, 1, col_white, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, card_x + 15, card_y + 52, card_w - 30, 1, col_border);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, card_x + 15, card_y + 58, card_w - 30, 22, col_topbar);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 20,  card_y + 63, "ID", 1, col_cyan, 0, 0);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 55,  card_y + 63, "ATTRIBUTE NAME", 1, col_cyan, 0, 0);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 310, card_y + 63, "VAL", 1, col_cyan, 0, 0);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 360, card_y + 63, "WORST", 1, col_cyan, 0, 0);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 430, card_y + 63, "THRESH", 1, col_cyan, 0, 0);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 500, card_y + 63, "RAW VALUE", 1, col_cyan, 0, 0);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 650, card_y + 63, "STATUS", 1, col_cyan, 0, 0);
+
+    int row_y = card_y + 83;
+    for (int i = 0; i < active_drv->attr_count && i < MAX_SMART_ATTRIBUTES; i++) {
+      SmartAttribute *attr = &active_drv->attributes[i];
+      UINT32 row_bg = (i % 2 == 0) ? col_card : col_topbar;
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, card_x + 15, row_y, card_w - 30, 20, row_bg);
+
+      char buf_id[8], buf_val[8], buf_worst[8], buf_thresh[8], buf_raw[16];
+      uprintf_str(buf_id, sizeof(buf_id), "0x%02X", attr->id);
+      uprintf_str(buf_val, sizeof(buf_val), "%u", attr->current_val);
+      uprintf_str(buf_worst, sizeof(buf_worst), "%u", attr->worst_val);
+      uprintf_str(buf_thresh, sizeof(buf_thresh), "%u", attr->threshold);
+      uprintf_str(buf_raw, sizeof(buf_raw), "%u", (UINT32)attr->raw_val);
+
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 20,  row_y + 3, buf_id, 1, col_gray, 0, 0);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 55,  row_y + 3, attr->name, 1, col_white, 0, 0);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 310, row_y + 3, buf_val, 1, col_white, 0, 0);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 360, row_y + 3, buf_worst, 1, col_white, 0, 0);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 430, row_y + 3, buf_thresh, 1, col_gray, 0, 0);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 500, row_y + 3, buf_raw, 1, col_cyan, 0, 0);
+
+      UINT32 st_col = attr->is_ok ? col_green : col_red;
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 650, row_y + 3, attr->is_ok ? "OK" : "WARN", 1, st_col, 0, 0);
+
+      row_y += 21;
+    }
+
+    int prog_panel_y = card_y + 340;
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, card_x + 15, prog_panel_y, card_w - 30, 105, col_topbar);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, card_x + 15, prog_panel_y, card_w - 30, 105, 1, col_border);
+
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 25, prog_panel_y + 10, state.status_msg, 1, col_yellow, 0, 0);
+
+    int bar_x = card_x + 25, bar_y = prog_panel_y + 32, bar_w = card_w - 180, bar_h = 18;
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, bar_x, bar_y, bar_w, bar_h, col_bg);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, bar_x, bar_y, bar_w, bar_h, 1, col_border);
+    int fill_w = (int)((state.progress_pct / 100.0f) * (float)bar_w);
+    if (fill_w > bar_w) fill_w = bar_w;
+    if (fill_w > 0) {
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, bar_x + 1, bar_y + 1, fill_w - 2, bar_h - 2, col_cyan);
+    }
+
+    char pct_buf[16];
+    uprintf_str(pct_buf, sizeof(pct_buf), "%u%%", (UINT32)state.progress_pct);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, bar_x + bar_w + 15, bar_y + 2, pct_buf, 1, col_white, 0, 0);
+
+    char stats_buf[128];
+    uprintf_str(stats_buf, sizeof(stats_buf), "Speed: %u MB/s | Latency: %uus | Scanned: %u LBA | Errors: %u | ETA: %us",
+                (UINT32)state.read_speed_mbps, state.latency_us, (UINT32)state.sectors_scanned, state.read_errors, state.eta_seconds);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 25, prog_panel_y + 60, stats_buf, 1, col_gray, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, btn1_x, btn1_y, btn_w, btn_h, hov_btn1 ? col_btn_hov : col_btn_bg);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, btn1_x, btn1_y, btn_w, btn_h, 1, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, btn1_x + 10, btn1_y + 10, "[1] NEXT DRIVE", 1, col_white, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, btn2_x, btn2_y, btn_w, btn_h, hov_btn2 ? col_btn_hov : col_btn_bg);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, btn2_x, btn2_y, btn_w, btn_h, 1, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, btn2_x + 10, btn2_y + 10, "[2] SHORT TEST", 1, col_white, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, btn3_x, btn3_y, btn_w, btn_h, hov_btn3 ? col_btn_hov : col_btn_bg);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, btn3_x, btn3_y, btn_w, btn_h, 1, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, btn3_x + 10, btn3_y + 10, "[3] EXTENDED", 1, col_white, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, btn4_x, btn4_y, btn_w, btn_h, hov_btn4 ? col_btn_hov : col_btn_bg);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, btn4_x, btn4_y, btn_w, btn_h, 1, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, btn4_x + 10, btn4_y + 10, "[4] REFRESH", 1, col_white, 0, 0);
+
+    fb_fill_rect(draw_fb, stride, screen_w, screen_h, btn5_x, btn5_y, btn_w, btn_h, hov_btn5 ? col_exit_hov : col_exit_norm);
+    fb_draw_rect(draw_fb, stride, screen_w, screen_h, btn5_x, btn5_y, btn_w, btn_h, 1, col_border);
+    fb_draw_text(draw_fb, stride, screen_w, screen_h, btn5_x + 15, btn5_y + 10, "[5] ABORT", 1, col_white, 0, 0);
+
+    fb_draw_cursor(draw_fb, stride, screen_w, screen_h, *cursor_x, *cursor_y, col_white, col_bg, curr_left_btn);
+
+    if (back_buf) {
+      memcpy(fb, back_buf, stride * screen_h * sizeof(UINT32));
+    }
+  }
+
+  return 0;
+}
+
+typedef struct {
+  const char *title;
+  const char *badge;      /* short label, e.g. "ZIG ENGINE" or "INTERACTIVE" */
+  int badge_is_zig;       /* 1 = cyan badge, 0 = green badge */
+  const char *line1;
+  const char *line2;
+  DiagTestFn run;
+} DiagTile;
+
+#define DIAG_TILES_PER_PAGE 4
+
 static int render_diagnostic_suite_screen(
   EFI_HANDLE ImageHandle,
   EFI_BOOT_SERVICES *bs,
@@ -889,6 +1186,29 @@ static int render_diagnostic_suite_screen(
   UINT32 col_exit_norm= make_color_gop(gop, 153, 27, 27);  /* #991B1B */
   UINT32 col_exit_hov = make_color_gop(gop, 220, 38, 38);  /* #DC2626 */
 
+  /* Data-driven tile list. Add a test by adding one entry here — it gets a
+   * slot, a page, a 1-4 hotkey, and a click target automatically. No more
+   * hand-copied tile0..tileN / hov_tileN / is_selN / draw-block per test. */
+  DiagTile tiles[] = {
+    { "Quick RAM Test",      "ZIG ENGINE",  1,
+      "Multi-pattern RAM integrity", "& real-time ETA engine",
+      run_zig_ram_test_screen },
+    { "SMART Drive Test",    "ZIG ENGINE",  1,
+      "Drive SMART health, surface scan", "& block I/O driver engine",
+      run_smart_test_screen },
+    { "Keyboard Matrix",     "INTERACTIVE", 0,
+      "Visual key layout tracker &", "stuck key detector [Zig]",
+      run_keyboard_matrix_screen },
+    { "Display Pixel Audit", "INTERACTIVE", 0,
+      "Full-screen solid RGB,", "dead pixel & grid test",
+      run_display_pixel_audit_screen },
+    { "PC Speaker Audio",    "INTERACTIVE", 0,
+      "8254 PIT tone generator", "& frequency sweep [Zig]",
+      run_pc_speaker_audio_screen },
+  };
+  int total_tiles = (int)(sizeof(tiles) / sizeof(tiles[0]));
+  int total_pages = (total_tiles + DIAG_TILES_PER_PAGE - 1) / DIAG_TILES_PER_PAGE;
+
   int card_w = 700, card_h = 420;
   int card_x = ((int)screen_w - card_w) / 2;
   int card_y = ((int)screen_h - card_h) / 2 + 10;
@@ -896,18 +1216,19 @@ static int render_diagnostic_suite_screen(
   int top_back_x = 15, top_back_y = 10, top_back_w = 90, top_back_h = 32;
   int top_exit_x = (int)screen_w - 110, top_exit_y = 10, top_exit_w = 95, top_exit_h = 32;
 
-  /* Grid Buttons (2x2 Grid) */
   int tile_w = 310, tile_h = 125;
-  int tile0_x = card_x + 25,  tile0_y = card_y + 80;
-  int tile1_x = card_x + 365, tile1_y = card_y + 80;
-  int tile2_x = card_x + 25,  tile2_y = card_y + 225;
-  int tile3_x = card_x + 365, tile3_y = card_y + 225;
+  int slot_x[DIAG_TILES_PER_PAGE] = { card_x + 25, card_x + 365, card_x + 25,  card_x + 365 };
+  int slot_y[DIAG_TILES_PER_PAGE] = { card_y + 80, card_y + 80,  card_y + 225, card_y + 225 };
+
+  int page_btn_w = 90, page_btn_h = 34;
+  int page_prev_x = card_x + 25,               page_prev_y = card_y + card_h - 50;
+  int page_next_x = card_x + card_w - 25 - page_btn_w, page_next_y = page_prev_y;
 
   int back_btn_x = card_x + (card_w - 220) / 2;
   int back_btn_y = card_y + card_h - 50;
   int back_btn_w = 220, back_btn_h = 38;
 
-  int selected_tile = 0;
+  int selected_tile = 0; /* global index into tiles[] */
 
   /* Flush key buffer */
   if (ST->ConIn) {
@@ -918,6 +1239,12 @@ static int render_diagnostic_suite_screen(
   for (;;) {
     UINT32 *draw_fb = back_buf ? back_buf : fb;
     BOOLEAN curr_left_btn = FALSE;
+    int page = selected_tile / DIAG_TILES_PER_PAGE;
+    int base = page * DIAG_TILES_PER_PAGE;
+    int slots_on_page = total_tiles - base;
+    if (slots_on_page > DIAG_TILES_PER_PAGE) slots_on_page = DIAG_TILES_PER_PAGE;
+    int local_sel = selected_tile - base;
+    int i;
 
     poll_pointer_inputs(screen_w, screen_h, cursor_x, cursor_y, &curr_left_btn);
     BOOLEAN click_event = (curr_left_btn && !(*prev_left_btn));
@@ -930,58 +1257,55 @@ static int render_diagnostic_suite_screen(
     if (key.UnicodeChar == L'x' || key.UnicodeChar == L'X') {
       return 1;
     }
-    if (key.UnicodeChar == L'1') {
-      selected_tile = 0;
-      int rret = run_zig_ram_test_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-      if (rret == 1) return 1;
-      continue;
-    } else if (key.UnicodeChar == L'2') {
-      selected_tile = 1;
-      int kret = run_keyboard_matrix_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-      if (kret == 1) return 1;
-      continue;
-    } else if (key.UnicodeChar == L'3') {
-      selected_tile = 2;
-      int dret = run_display_pixel_audit_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-      if (dret == 1) return 1;
-      continue;
-    } else if (key.UnicodeChar == L'4') {
-      selected_tile = 3;
-      int aret = run_pc_speaker_audio_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-      if (aret == 1) return 1;
-      continue;
-    } else if (key.UnicodeChar == L'\r' || key.UnicodeChar == L' ') {
-      if (selected_tile == 0) {
-        int rret = run_zig_ram_test_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
+    if (key.UnicodeChar >= L'1' && key.UnicodeChar <= L'4') {
+      int idx = base + (int)(key.UnicodeChar - L'1');
+      if (idx < total_tiles) {
+        selected_tile = idx;
+        int rret = tiles[idx].run(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
         if (rret == 1) return 1;
-        continue;
-      } else if (selected_tile == 1) {
-        int kret = run_keyboard_matrix_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-        if (kret == 1) return 1;
-        continue;
-      } else if (selected_tile == 2) {
-        int dret = run_display_pixel_audit_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-        if (dret == 1) return 1;
-        continue;
-      } else if (selected_tile == 3) {
-        int aret = run_pc_speaker_audio_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-        if (aret == 1) return 1;
         continue;
       }
     }
+    if (key.UnicodeChar == L'\r' || key.UnicodeChar == L' ') {
+      int rret = tiles[selected_tile].run(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
+      if (rret == 1) return 1;
+      continue;
+    }
 
     if (key.ScanCode == SCAN_UP) {
-      if (selected_tile >= 2) selected_tile -= 2;
+      if (local_sel >= 2) selected_tile -= 2;
       *cursor_y -= 15;
     } else if (key.ScanCode == SCAN_DOWN) {
-      if (selected_tile < 2) selected_tile += 2;
+      if (local_sel < 2 && selected_tile + 2 < total_tiles) selected_tile += 2;
       *cursor_y += 15;
     } else if (key.ScanCode == SCAN_LEFT) {
-      if (selected_tile % 2 == 1) selected_tile -= 1;
+      if (local_sel % 2 == 1) {
+        selected_tile -= 1;
+      } else if (total_pages > 1) {
+        int new_page = (page - 1 + total_pages) % total_pages;
+        int candidate = new_page * DIAG_TILES_PER_PAGE + local_sel + 1;
+        if (candidate < total_tiles) selected_tile = candidate;
+      }
       *cursor_x -= 15;
     } else if (key.ScanCode == SCAN_RIGHT) {
-      if (selected_tile % 2 == 0) selected_tile += 1;
+      if (local_sel % 2 == 0 && (local_sel + 1) < slots_on_page) {
+        selected_tile += 1;
+      } else if (total_pages > 1) {
+        int new_page = (page + 1) % total_pages;
+        int candidate = new_page * DIAG_TILES_PER_PAGE + (local_sel - (local_sel % 2));
+        if (candidate < total_tiles) selected_tile = candidate;
+      }
       *cursor_x += 15;
+    } else if (key.ScanCode == SCAN_PAGE_UP || key.UnicodeChar == L'[') {
+      if (total_pages > 1) {
+        int new_page = (page - 1 + total_pages) % total_pages;
+        selected_tile = new_page * DIAG_TILES_PER_PAGE;
+      }
+    } else if (key.ScanCode == SCAN_PAGE_DOWN || key.UnicodeChar == L']') {
+      if (total_pages > 1) {
+        int new_page = (page + 1) % total_pages;
+        selected_tile = new_page * DIAG_TILES_PER_PAGE;
+      }
     }
 
     if (*cursor_x < 0) *cursor_x = 0;
@@ -989,46 +1313,38 @@ static int render_diagnostic_suite_screen(
     if (*cursor_x >= (int)screen_w) *cursor_x = (int)screen_w - 1;
     if (*cursor_y >= (int)screen_h) *cursor_y = (int)screen_h - 1;
 
+    /* Recompute in case a key handler above moved selected_tile */
+    page = selected_tile / DIAG_TILES_PER_PAGE;
+    base = page * DIAG_TILES_PER_PAGE;
+    slots_on_page = total_tiles - base;
+    if (slots_on_page > DIAG_TILES_PER_PAGE) slots_on_page = DIAG_TILES_PER_PAGE;
+    local_sel = selected_tile - base;
+
     int hov_back_top = point_in_rect(*cursor_x, *cursor_y, top_back_x, top_back_y, top_back_w, top_back_h);
     int hov_exit_top = point_in_rect(*cursor_x, *cursor_y, top_exit_x, top_exit_y, top_exit_w, top_exit_h);
-    int hov_tile0    = point_in_rect(*cursor_x, *cursor_y, tile0_x, tile0_y, tile_w, tile_h);
-    int hov_tile1    = point_in_rect(*cursor_x, *cursor_y, tile1_x, tile1_y, tile_w, tile_h);
-    int hov_tile2    = point_in_rect(*cursor_x, *cursor_y, tile2_x, tile2_y, tile_w, tile_h);
-    int hov_tile3    = point_in_rect(*cursor_x, *cursor_y, tile3_x, tile3_y, tile_w, tile_h);
-    int hov_back_main= point_in_rect(*cursor_x, *cursor_y, back_btn_x, back_btn_y, back_btn_w, back_btn_h);
-
-    if (hov_tile0) selected_tile = 0;
-    if (hov_tile1) selected_tile = 1;
-    if (hov_tile2) selected_tile = 2;
-    if (hov_tile3) selected_tile = 3;
-
-    int is_sel0 = (selected_tile == 0);
-    int is_sel1 = (selected_tile == 1);
-    int is_sel2 = (selected_tile == 2);
-    int is_sel3 = (selected_tile == 3);
+    int hov_slot[DIAG_TILES_PER_PAGE] = {0,0,0,0};
+    for (i = 0; i < slots_on_page; i++) {
+      hov_slot[i] = point_in_rect(*cursor_x, *cursor_y, slot_x[i], slot_y[i], tile_w, tile_h);
+      if (hov_slot[i]) selected_tile = base + i;
+    }
+    int hov_prev = total_pages > 1 && point_in_rect(*cursor_x, *cursor_y, page_prev_x, page_prev_y, page_btn_w, page_btn_h);
+    int hov_next = total_pages > 1 && point_in_rect(*cursor_x, *cursor_y, page_next_x, page_next_y, page_btn_w, page_btn_h);
+    int hov_back_main = (total_pages <= 1) &&
+      point_in_rect(*cursor_x, *cursor_y, back_btn_x, back_btn_y, back_btn_w, back_btn_h);
 
     if (click_event) {
-      if (hov_back_top || hov_back_main) return 0;
+      if (hov_back_top) return 0;
       if (hov_exit_top) return 1;
-      if (hov_tile0) {
-        int rret = run_zig_ram_test_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-        if (rret == 1) return 1;
-        continue;
-      }
-      if (hov_tile1) {
-        int kret = run_keyboard_matrix_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-        if (kret == 1) return 1;
-        continue;
-      }
-      if (hov_tile2) {
-        int dret = run_display_pixel_audit_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-        if (dret == 1) return 1;
-        continue;
-      }
-      if (hov_tile3) {
-        int aret = run_pc_speaker_audio_screen(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
-        if (aret == 1) return 1;
-        continue;
+      if (hov_back_main) return 0;
+      if (hov_prev) { int np = (page - 1 + total_pages) % total_pages; selected_tile = np * DIAG_TILES_PER_PAGE; continue; }
+      if (hov_next) { int np = (page + 1) % total_pages; selected_tile = np * DIAG_TILES_PER_PAGE; continue; }
+      for (i = 0; i < slots_on_page; i++) {
+        if (hov_slot[i]) {
+          int idx = base + i;
+          int rret = tiles[idx].run(bs, gop, fb, back_buf, stride, screen_w, screen_h, cursor_x, cursor_y, prev_left_btn);
+          if (rret == 1) return 1;
+          goto next_frame;
+        }
       }
     }
 
@@ -1058,53 +1374,47 @@ static int render_diagnostic_suite_screen(
 
     /* Card Header Titles */
     fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 25, card_y + 20, "SELECT DIAGNOSTIC BENCHMARK", 2, col_cyan, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 25, card_y + 50, "Use Arrow Keys + Enter or Keys 1-4 to select a benchmark", 1, col_gray, 0, 0);
+    if (total_pages > 1) {
+      char page_str[64];
+      uprintf_str(page_str, sizeof(page_str), "Page %u/%u  -  Keys 1-4, [ ] to page, Enter to run", (UINT64)(page + 1), (UINT64)total_pages);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 25, card_y + 50, page_str, 1, col_gray, 0, 0);
+    } else {
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, card_x + 25, card_y + 50, "Use Arrow Keys + Enter or Keys 1-4 to select a benchmark", 1, col_gray, 0, 0);
+    }
 
-    /* Tile 0: Quick RAM Test [ZIG] */
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile0_x, tile0_y, tile_w, tile_h, is_sel0 ? col_btn_hov : col_btn_bg);
-    fb_draw_rect(draw_fb, stride, screen_w, screen_h, tile0_x, tile0_y, tile_w, tile_h, 2, is_sel0 ? col_cyan : col_border);
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile0_x + 200, tile0_y + 12, 95, 20, col_cyan);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile0_x + 208, tile0_y + 16, "ZIG ENGINE", 1, col_topbar, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile0_x + 15, tile0_y + 14, "1. Quick RAM Test", 1, col_white, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile0_x + 15, tile0_y + 45,
-                 "Multi-pattern RAM integrity\n"
-                 "& real-time ETA engine", 1, col_gray, 0, 0);
+    /* Draw tiles for the current page */
+    for (i = 0; i < slots_on_page; i++) {
+      DiagTile *t = &tiles[base + i];
+      int is_sel = (local_sel == i);
+      UINT32 badge_col = t->badge_is_zig ? col_cyan : col_green;
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, slot_x[i], slot_y[i], tile_w, tile_h, is_sel ? col_btn_hov : col_btn_bg);
+      fb_draw_rect(draw_fb, stride, screen_w, screen_h, slot_x[i], slot_y[i], tile_w, tile_h, 2, is_sel ? col_cyan : col_border);
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, slot_x[i] + 200, slot_y[i] + 12, 95, 20, badge_col);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, slot_x[i] + 208, slot_y[i] + 16, t->badge, 1, col_topbar, 0, 0);
+      char title_buf[40];
+      uprintf_str(title_buf, sizeof(title_buf), "%u. %s", (UINT64)(base + i + 1), t->title);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, slot_x[i] + 15, slot_y[i] + 14, title_buf, 1, col_white, 0, 0);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, slot_x[i] + 15, slot_y[i] + 45, t->line1, 1, col_gray, 0, 0);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, slot_x[i] + 15, slot_y[i] + 62, t->line2, 1, col_gray, 0, 0);
+    }
 
-    /* Tile 1: Keyboard Matrix [ZIG] */
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile1_x, tile1_y, tile_w, tile_h, is_sel1 ? col_btn_hov : col_btn_bg);
-    fb_draw_rect(draw_fb, stride, screen_w, screen_h, tile1_x, tile1_y, tile_w, tile_h, 2, is_sel1 ? col_cyan : col_border);
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile1_x + 200, tile1_y + 12, 95, 20, col_green);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile1_x + 208, tile1_y + 16, "INTERACTIVE", 1, col_topbar, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile1_x + 15, tile1_y + 14, "2. Keyboard Matrix", 1, col_white, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile1_x + 15, tile1_y + 45,
-                 "Visual key layout tracker &\n"
-                 "stuck key detector [Zig]", 1, col_gray, 0, 0);
+    /* Page nav (replaces the single Back button once there's more than one page) */
+    if (total_pages > 1) {
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, page_prev_x, page_prev_y, page_btn_w, page_btn_h,
+                   hov_prev ? col_btn_hov : col_card);
+      fb_draw_rect(draw_fb, stride, screen_w, screen_h, page_prev_x, page_prev_y, page_btn_w, page_btn_h, 2, col_border);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, page_prev_x + 14, page_prev_y + 9, "< Prev", 1, col_white, 0, 0);
 
-    /* Tile 2: Display & Pixel Audit [C] */
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile2_x, tile2_y, tile_w, tile_h, is_sel2 ? col_btn_hov : col_btn_bg);
-    fb_draw_rect(draw_fb, stride, screen_w, screen_h, tile2_x, tile2_y, tile_w, tile_h, 2, is_sel2 ? col_cyan : col_border);
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile2_x + 200, tile2_y + 12, 95, 20, col_green);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile2_x + 208, tile2_y + 16, "INTERACTIVE", 1, col_topbar, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile2_x + 15, tile2_y + 14, "3. Display Pixel Audit", 1, col_white, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile2_x + 15, tile2_y + 45,
-                 "Full-screen solid RGB,\n"
-                 "dead pixel & grid test", 1, col_gray, 0, 0);
-
-    /* Tile 3: PC Speaker Audio [ZIG] */
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile3_x, tile3_y, tile_w, tile_h, is_sel3 ? col_btn_hov : col_btn_bg);
-    fb_draw_rect(draw_fb, stride, screen_w, screen_h, tile3_x, tile3_y, tile_w, tile_h, 2, is_sel3 ? col_cyan : col_border);
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, tile3_x + 200, tile3_y + 12, 95, 20, col_green);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile3_x + 208, tile3_y + 16, "INTERACTIVE", 1, col_topbar, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile3_x + 15, tile3_y + 14, "4. PC Speaker Audio", 1, col_white, 0, 0);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, tile3_x + 15, tile3_y + 45,
-                 "8254 PIT tone generator\n"
-                 "& frequency sweep [Zig]", 1, col_gray, 0, 0);
-
-    /* Back Button */
-    fb_fill_rect(draw_fb, stride, screen_w, screen_h, back_btn_x, back_btn_y, back_btn_w, back_btn_h,
-                 hov_back_main ? col_btn_hov : col_card);
-    fb_draw_rect(draw_fb, stride, screen_w, screen_h, back_btn_x, back_btn_y, back_btn_w, back_btn_h, 2, col_border);
-    fb_draw_text(draw_fb, stride, screen_w, screen_h, back_btn_x + 20, back_btn_y + 11, "Back to Main Menu", 1, col_white, 0, 0);
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, page_next_x, page_next_y, page_btn_w, page_btn_h,
+                   hov_next ? col_btn_hov : col_card);
+      fb_draw_rect(draw_fb, stride, screen_w, screen_h, page_next_x, page_next_y, page_btn_w, page_btn_h, 2, col_border);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, page_next_x + 12, page_next_y + 9, "Next >", 1, col_white, 0, 0);
+    } else {
+      fb_fill_rect(draw_fb, stride, screen_w, screen_h, back_btn_x, back_btn_y, back_btn_w, back_btn_h,
+                   hov_back_main ? col_btn_hov : col_card);
+      fb_draw_rect(draw_fb, stride, screen_w, screen_h, back_btn_x, back_btn_y, back_btn_w, back_btn_h, 2, col_border);
+      fb_draw_text(draw_fb, stride, screen_w, screen_h, back_btn_x + 20, back_btn_y + 11, "Back to Main Menu", 1, col_white, 0, 0);
+    }
 
     /* Draw Pointer Cursor */
     fb_draw_cursor(draw_fb, stride, screen_w, screen_h, *cursor_x, *cursor_y, col_white, make_color_gop(gop, 0, 0, 0), curr_left_btn);
@@ -1113,6 +1423,7 @@ static int render_diagnostic_suite_screen(
       memcpy((void*)fb, (const void*)back_buf, (UINTN)screen_h * stride * sizeof(UINT32));
     }
     if (bs && bs->Stall) bs->Stall(16000);
+    next_frame:;
   }
 }
 

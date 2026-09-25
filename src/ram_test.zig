@@ -20,6 +20,7 @@ pub const RamTestState = extern struct {
     chunk_words: usize,
     current_chunk_idx: usize,
     start_tsc: u64,
+    rng_seed: u64,
 };
 
 const PATTERN_NAMES = [_][32]u8{
@@ -28,6 +29,8 @@ const PATTERN_NAMES = [_][32]u8{
     make_name("0x00000000 (Zero Fill)"),
     make_name("0xFFFFFFFF (Ones Fill)"),
     make_name("Address XOR Pattern"),
+    make_name("Walking Ones (1-bit)"),
+    make_name("PRNG Random Fill"),
 };
 
 const PATTERN_VALUES = [_]u64{
@@ -35,8 +38,19 @@ const PATTERN_VALUES = [_]u64{
     0xAAAAAAAAAAAAAAAA,
     0x0000000000000000,
     0xFFFFFFFFFFFFFFFF,
-    0, // Special pattern flag
+    0, // Special pattern flag (Address XOR)
+    0, // Special pattern flag (Walking Ones)
+    0, // Special pattern flag (PRNG Random)
 };
+
+// xorshift64* — deterministic, so write and verify passes regenerate the
+// exact same sequence from the same seed without needing a second buffer.
+inline fn xorshift64star(x: *u64) u64 {
+    x.* ^= x.* >> 12;
+    x.* ^= x.* << 25;
+    x.* ^= x.* >> 27;
+    return x.* *% 0x2545F4914F6CDD1D;
+}
 
 fn make_name(comptime str: []const u8) [32]u8 {
     var buf = [_]u8{0} ** 32;
@@ -85,6 +99,9 @@ pub export fn ram_test_init(state: *RamTestState, mem_ptr: ?*anyopaque, size_byt
     state.chunk_words = chunk_w;
     state.current_chunk_idx = 0;
     state.start_tsc = get_tsc();
+    // Non-zero seed required by xorshift64*; TSC is never exactly 0 in practice
+    // but guard it anyway so a degenerate seed can't zero the whole stream.
+    state.rng_seed = get_tsc() | 1;
 
     const num_chunks = (words + chunk_w - 1) / chunk_w;
     state.total_steps = @as(u32, @intCast(num_chunks * PATTERN_NAMES.len));
@@ -121,6 +138,41 @@ pub export fn ram_test_step(state: *RamTestState) void {
         i = 0;
         while (i < chunk_len) : (i += 1) {
             const expected = @as(u64, @intCast(chunk_start + i)) ^ 0xDEADBEEFCAFEBABE;
+            if (ptr[chunk_start + i] != expected) {
+                state.errors_found += 1;
+                state.is_passed = false;
+            }
+        }
+    } else if (pat_idx == 5) {
+        // Walking Ones: each word gets a single bit set, rotating by
+        // address so adjacent words never share the same bit position —
+        // exercises bit-line-to-bit-line coupling within a word.
+        while (i < chunk_len) : (i += 1) {
+            const bit_pos: u6 = @truncate((chunk_start + i) % 64);
+            ptr[chunk_start + i] = @as(u64, 1) << bit_pos;
+        }
+        i = 0;
+        while (i < chunk_len) : (i += 1) {
+            const bit_pos: u6 = @truncate((chunk_start + i) % 64);
+            const expected = @as(u64, 1) << bit_pos;
+            if (ptr[chunk_start + i] != expected) {
+                state.errors_found += 1;
+                state.is_passed = false;
+            }
+        }
+    } else if (pat_idx == 6) {
+        // PRNG Random Fill: xorshift64* stream reseeded from the same
+        // per-chunk value on both passes, so no random buffer is stored.
+        var rng: u64 = state.rng_seed ^ @as(u64, @intCast(chunk_start));
+        rng |= 1;
+        while (i < chunk_len) : (i += 1) {
+            ptr[chunk_start + i] = xorshift64star(&rng);
+        }
+        rng = state.rng_seed ^ @as(u64, @intCast(chunk_start));
+        rng |= 1;
+        i = 0;
+        while (i < chunk_len) : (i += 1) {
+            const expected = xorshift64star(&rng);
             if (ptr[chunk_start + i] != expected) {
                 state.errors_found += 1;
                 state.is_passed = false;

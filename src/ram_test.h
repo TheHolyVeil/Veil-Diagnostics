@@ -23,6 +23,7 @@ typedef struct {
     UINTN chunk_words;
     UINTN current_chunk_idx;
     UINT64 start_tsc;
+    UINT64 rng_seed;
 } RamTestState;
 
 /* Exported C functions from src/ram_test.zig */

@@ -105,6 +105,12 @@ static const EFI_GUID gEfiSimplePointerProtocolGuid = GUID(
   0x31878C87,0x0B75,0x11D5, 0x9A,0x4F,0x00,0x90,0x27,0x3F,0xC1,0x4D);
 static const EFI_GUID gEfiAbsolutePointerProtocolGuid = GUID(
   0x8D59D32B,0xC655,0x4AE9, 0x9B,0x15,0xF2,0x59,0x04,0x99,0x2A,0x43);
+static const EFI_GUID gEfiAtaPassThruProtocolGuid = GUID(
+  0x19445209,0x16EA,0x47E7, 0xB9,0x89,0x22,0x32,0xC8,0xC0,0x86,0x8D);
+static const EFI_GUID gEfiNvmExpressPassThruProtocolGuid = GUID(
+  0x52C78312,0x8EDC,0x4233, 0x98,0xF2,0x1A,0x1A,0xA5,0xE3,0x88,0xA5);
+static const EFI_GUID gEfiDiskIoProtocolGuid = GUID(
+  0xCE345171,0xBA0B,0x11D2, 0x8E,0x4F,0x00,0xA0,0xC9,0x69,0x72,0x3B);
 
 static inline int guid_equal(const EFI_GUID *a, const EFI_GUID *b) {
   const UINT8 *x = (const UINT8*)a, *y = (const UINT8*)b;
@@ -286,6 +292,17 @@ typedef struct _EFI_RUNTIME_SERVICES {
 } EFI_RUNTIME_SERVICES;
 
 /* ---- Boot services ------------------------------------------------------ */
+/* EFI_ALLOCATE_TYPE, verified against UEFI spec / EDK2 MdePkg UefiSpec.h */
+typedef enum {
+  AllocateAnyPages,
+  AllocateMaxAddress,
+  AllocateAddress,
+  MaxAllocateType
+} EFI_ALLOCATE_TYPE;
+
+typedef EFI_STATUS (EFIAPI *BS_ALLOCATE_PAGES)(
+  EFI_ALLOCATE_TYPE Type, UINTN MemoryType, UINTN Pages, EFI_PHYSICAL_ADDRESS *Memory);
+typedef EFI_STATUS (EFIAPI *BS_FREE_PAGES)(EFI_PHYSICAL_ADDRESS Memory, UINTN Pages);
 typedef EFI_STATUS (EFIAPI *BS_GET_MEMORY_MAP)(
   UINTN *MemoryMapSize, VOID *MemoryMap, UINTN *MapKey,
   UINTN *DescriptorSize, UINT32 *DescriptorVersion);
@@ -319,8 +336,8 @@ typedef struct _EFI_BOOT_SERVICES {
   EFI_TABLE_HEADER        Hdr;
   VOID*                  RaiseTPL;
   VOID*                  RestoreTPL;
-  VOID*                  AllocatePages;
-  VOID*                  FreePages;
+  BS_ALLOCATE_PAGES      AllocatePages;
+  BS_FREE_PAGES          FreePages;
   BS_GET_MEMORY_MAP      GetMemoryMap;
   BS_ALLOCATE_POOL       AllocatePool;
   BS_FREE_POOL           FreePool;
