@@ -214,20 +214,7 @@ void serial_write_str(const char *s) {
   }
 }
 
-static void connect_all_controllers(EFI_BOOT_SERVICES *bs) {
-  if (!bs || !bs->LocateHandleBuffer || !bs->ConnectController) return;
 
-  UINTN count = 0;
-  EFI_HANDLE *handles = NULL;
-  #define EFI_ALL_HANDLES 0
-  if (!EFI_ERROR(bs->LocateHandleBuffer(EFI_ALL_HANDLES, NULL, NULL, &count, &handles)) && handles) {
-    UINTN i;
-    for (i = 0; i < count; i++) {
-      bs->ConnectController(handles[i], NULL, NULL, TRUE);
-    }
-    bs->FreePool(handles);
-  }
-}
 
 static void add_simple_pointer_if_new(EFI_SIMPLE_POINTER_PROTOCOL *sp) {
   if (!sp) return;
@@ -252,12 +239,11 @@ static void add_abs_pointer_if_new(EFI_ABSOLUTE_POINTER_PROTOCOL *ap) {
 }
 
 void init_pointer_protocols(EFI_HANDLE ImageHandle, EFI_BOOT_SERVICES *bs) {
+  (VOID)ImageHandle;
   g_num_simple_pointers = 0;
   g_num_abs_pointers = 0;
 
   if (!bs) return;
-
-  connect_all_controllers(bs);
 
   if (bs->LocateProtocol) {
     EFI_SIMPLE_POINTER_PROTOCOL *sp = NULL;
@@ -281,7 +267,7 @@ void init_pointer_protocols(EFI_HANDLE ImageHandle, EFI_BOOT_SERVICES *bs) {
     }
   }
 
-  if (bs->LocateHandleBuffer) {
+  if (bs->LocateHandleBuffer && bs->HandleProtocol) {
     UINTN count = 0;
     EFI_HANDLE *handles = NULL;
 
@@ -289,9 +275,7 @@ void init_pointer_protocols(EFI_HANDLE ImageHandle, EFI_BOOT_SERVICES *bs) {
       UINTN i;
       for (i = 0; i < count; i++) {
         EFI_SIMPLE_POINTER_PROTOCOL *sp = NULL;
-        if (bs->OpenProtocol && !EFI_ERROR(bs->OpenProtocol(handles[i], (EFI_GUID*)&gEfiSimplePointerProtocolGuid, (VOID**)&sp, ImageHandle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL)) && sp) {
-          add_simple_pointer_if_new(sp);
-        } else if (bs->HandleProtocol && !EFI_ERROR(bs->HandleProtocol(handles[i], (EFI_GUID*)&gEfiSimplePointerProtocolGuid, (VOID**)&sp)) && sp) {
+        if (!EFI_ERROR(bs->HandleProtocol(handles[i], (EFI_GUID*)&gEfiSimplePointerProtocolGuid, (VOID**)&sp)) && sp) {
           add_simple_pointer_if_new(sp);
         }
       }
@@ -303,42 +287,29 @@ void init_pointer_protocols(EFI_HANDLE ImageHandle, EFI_BOOT_SERVICES *bs) {
       UINTN i;
       for (i = 0; i < count; i++) {
         EFI_ABSOLUTE_POINTER_PROTOCOL *ap = NULL;
-        if (bs->OpenProtocol && !EFI_ERROR(bs->OpenProtocol(handles[i], (EFI_GUID*)&gEfiAbsolutePointerProtocolGuid, (VOID**)&ap, ImageHandle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL)) && ap) {
-          add_abs_pointer_if_new(ap);
-        } else if (bs->HandleProtocol && !EFI_ERROR(bs->HandleProtocol(handles[i], (EFI_GUID*)&gEfiAbsolutePointerProtocolGuid, (VOID**)&ap)) && ap) {
+        if (!EFI_ERROR(bs->HandleProtocol(handles[i], (EFI_GUID*)&gEfiAbsolutePointerProtocolGuid, (VOID**)&ap)) && ap) {
           add_abs_pointer_if_new(ap);
         }
       }
       bs->FreePool(handles);
     }
   }
-
-  /* Flush/reset pointer buffer states once on init */
-  UINTN i;
-  for (i = 0; i < g_num_simple_pointers; i++) {
-    if (g_simple_pointers[i] && g_simple_pointers[i]->Reset) {
-      g_simple_pointers[i]->Reset(g_simple_pointers[i], FALSE);
-    }
-  }
-  for (i = 0; i < g_num_abs_pointers; i++) {
-    if (g_abs_pointers[i] && g_abs_pointers[i]->Reset) {
-      g_abs_pointers[i]->Reset(g_abs_pointers[i], FALSE);
-    }
-  }
 }
 
 void poll_pointer_inputs(UINT32 screen_w, UINT32 screen_h, int *cursor_x, int *cursor_y, BOOLEAN *curr_left_btn) {
   UINTN i;
-  BOOLEAN got_relative_packet = FALSE;
+  static UINT64 frame_cnt = 0;
+  frame_cnt++;
 
   for (i = 0; i < g_num_simple_pointers; i++) {
     EFI_SIMPLE_POINTER_PROTOCOL *sp = g_simple_pointers[i];
     if (!sp || !sp->GetState) continue;
 
     EFI_SIMPLE_POINTER_STATE state = {0};
-    if (sp->GetState(sp, &state) == EFI_SUCCESS) {
+    EFI_STATUS st = sp->GetState(sp, &state);
+
+    if (st == EFI_SUCCESS) {
       g_mouse_packets_count++;
-      got_relative_packet = TRUE;
 
       *cursor_x += state.RelativeMovementX;
       *cursor_y += state.RelativeMovementY;
@@ -346,67 +317,59 @@ void poll_pointer_inputs(UINT32 screen_w, UINT32 screen_h, int *cursor_x, int *c
       g_last_dy = state.RelativeMovementY;
 
       if (state.LeftButton) *curr_left_btn = TRUE;
-    }
-  }
 
-  /* Absolute Pointer devices (e.g. a laptop touchpad's UEFI driver) are only
-   * trusted when no relative device produced a packet this poll. On real
-   * hardware it's common to have BOTH a Simple Pointer handle (real mouse)
-   * and an idle/phantom Absolute Pointer handle. The old code applied the
-   * absolute reading unconditionally *after* the relative update, so a
-   * stale default packet (often reporting the device's min corner, i.e.
-   * bottom-left, with a garbage ActiveButtons bit) stomped the cursor and
-   * click state back every single frame — that's the "stuck" behavior. */
-  if (!got_relative_packet) {
-    for (i = 0; i < g_num_abs_pointers; i++) {
-      EFI_ABSOLUTE_POINTER_PROTOCOL *ap = g_abs_pointers[i];
-      if (!ap || !ap->GetState) continue;
-
-      EFI_ABSOLUTE_POINTER_STATE astate = {0};
-      EFI_STATUS abs_status = ap->GetState(ap, &astate);
-      if (i == 0) {
-        g_last_abs_status = abs_status;
-        if (ap->Mode) {
-          g_abs_min_x = ap->Mode->AbsoluteMinX; g_abs_max_x = ap->Mode->AbsoluteMaxX;
-          g_abs_min_y = ap->Mode->AbsoluteMinY; g_abs_max_y = ap->Mode->AbsoluteMaxY;
-        }
-        g_abs_cur_x = astate.CurrentX; g_abs_cur_y = astate.CurrentY;
-      }
-      if (abs_status == EFI_SUCCESS) {
-        g_mouse_packets_count++;
-
-        if (ap->Mode && ap->Mode->AbsoluteMaxX > ap->Mode->AbsoluteMinX &&
-            ap->Mode->AbsoluteMaxY > ap->Mode->AbsoluteMinY) {
-          UINT64 spanX = ap->Mode->AbsoluteMaxX - ap->Mode->AbsoluteMinX;
-          UINT64 spanY = ap->Mode->AbsoluteMaxY - ap->Mode->AbsoluteMinY;
-          UINT64 relX  = astate.CurrentX - ap->Mode->AbsoluteMinX;
-          UINT64 relY  = astate.CurrentY - ap->Mode->AbsoluteMinY;
-          int new_x = (int)((relX * screen_w) / spanX);
-          int new_y = (int)((relY * screen_h) / spanY);
-          /* Absolute devices report position, not delta — synthesize dX/dY
-           * from the change since last poll so the HUD isn't dead-zero. */
-          g_last_dx = new_x - *cursor_x;
-          g_last_dy = new_y - *cursor_y;
-          *cursor_x = new_x;
-          *cursor_y = new_y;
-        }
-        if (astate.ActiveButtons & 1) *curr_left_btn = TRUE;
-      }
-    }
-  }
-
-  {
-    static UINT64 poll_n = 0;
-    poll_n++;
-    if ((poll_n % 30) == 0) {
-      char dbg[220];
-      uprintf_str(dbg, sizeof(dbg),
-        "poll#%u simple=%u abs=%u pkts=%u relpkt=%u cx=%d cy=%d dx=%d dy=%d absSt=%u absCur=%u,%u\n",
-        poll_n, (UINT64)g_num_simple_pointers, (UINT64)g_num_abs_pointers, g_mouse_packets_count,
-        (UINT64)got_relative_packet, (INT64)*cursor_x, (INT64)*cursor_y, (INT64)g_last_dx, (INT64)g_last_dy,
-        (UINT64)g_last_abs_status, g_abs_cur_x, g_abs_cur_y);
+      char dbg[160];
+      uprintf_str(dbg, sizeof(dbg), "[SIMPLE #%u] relX=%d relY=%d btnL=%u btnR=%u\n",
+                  i, (INT64)state.RelativeMovementX, (INT64)state.RelativeMovementY,
+                  (UINT64)state.LeftButton, (UINT64)state.RightButton);
       serial_write_str(dbg);
     }
+  }
+
+  for (i = 0; i < g_num_abs_pointers; i++) {
+    EFI_ABSOLUTE_POINTER_PROTOCOL *ap = g_abs_pointers[i];
+    if (!ap || !ap->GetState) continue;
+
+    EFI_ABSOLUTE_POINTER_STATE astate = {0};
+    EFI_STATUS abs_status = ap->GetState(ap, &astate);
+
+    if (abs_status == EFI_SUCCESS) {
+      g_mouse_packets_count++;
+      char adbg[160];
+      uprintf_str(adbg, sizeof(adbg), "[ABS #%u] curX=%u curY=%u btn=%u\n",
+                  i, astate.CurrentX, astate.CurrentY, (UINT64)astate.ActiveButtons);
+      serial_write_str(adbg);
+
+      if (ap->Mode && ap->Mode->AbsoluteMaxX > ap->Mode->AbsoluteMinX &&
+          ap->Mode->AbsoluteMaxY > ap->Mode->AbsoluteMinY) {
+        UINT64 spanX = ap->Mode->AbsoluteMaxX - ap->Mode->AbsoluteMinX;
+        UINT64 spanY = ap->Mode->AbsoluteMaxY - ap->Mode->AbsoluteMinY;
+        UINT64 relX  = (astate.CurrentX >= ap->Mode->AbsoluteMinX) ? (astate.CurrentX - ap->Mode->AbsoluteMinX) : 0;
+        UINT64 relY  = (astate.CurrentY >= ap->Mode->AbsoluteMinY) ? (astate.CurrentY - ap->Mode->AbsoluteMinY) : 0;
+
+        int new_x = (int)((relX * screen_w) / spanX);
+        int new_y = (int)((relY * screen_h) / spanY);
+
+        g_last_dx = new_x - *cursor_x;
+        g_last_dy = new_y - *cursor_y;
+        *cursor_x = new_x;
+        *cursor_y = new_y;
+      }
+      if (astate.ActiveButtons & 1) *curr_left_btn = TRUE;
+    }
+  }
+
+  if (*cursor_x < 0) *cursor_x = 0;
+  if (*cursor_y < 0) *cursor_y = 0;
+  if (*cursor_x >= (int)screen_w) *cursor_x = (int)screen_w - 1;
+  if (*cursor_y >= (int)screen_h) *cursor_y = (int)screen_h - 1;
+
+  if ((frame_cnt % 60) == 0) {
+    char hdbg[160];
+    uprintf_str(hdbg, sizeof(hdbg), "HEARTBEAT #%u simple_n=%u abs_n=%u pkts=%u cx=%d cy=%d\n",
+                frame_cnt, (UINT64)g_num_simple_pointers, (UINT64)g_num_abs_pointers,
+                g_mouse_packets_count, (INT64)*cursor_x, (INT64)*cursor_y);
+    serial_write_str(hdbg);
   }
 }
 

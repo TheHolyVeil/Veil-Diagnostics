@@ -14,8 +14,8 @@ COPY_EFI=0
 
 for arg in "$@"; do
   case "$arg" in
-    --build-only) BUILD_ONLY=1 ;;
-    --copy)       COPY_EFI=1 ;;
+  --build-only) BUILD_ONLY=1 ;;
+  --copy) COPY_EFI=1 ;;
   esac
 done
 
@@ -98,12 +98,13 @@ ESP="$OUT/esp"
 rm -rf "$ESP"
 mkdir -p "$ESP/EFI/BOOT"
 cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
+echo '\EFI\BOOT\BOOTX64.EFI' >"$ESP/startup.nsh"
 
 QEMU_ARGS=(
   -m 512
   -net none
-  -device qemu-xhci,id=xhci
-  -device usb-tablet,bus=xhci.0
+  -device qemu-xhci
+  -device usb-tablet
   -serial stdio
   -monitor unix:"$OUT/hwdiag-mon.sock",server,nowait
   -drive format=raw,file=fat:rw:"$ESP"
